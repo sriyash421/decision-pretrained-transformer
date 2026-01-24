@@ -61,3 +61,15 @@ It is recommended to run batches of data collection in parallel for Miniworld be
   year={2023}
 }
 ```
+
+-- AAWR results
+-- DPT final results
+-- RL^2 no norm on longer horizon
+-- ADVISOR run
+-- BC+PPO run
+-- (re-run all if ADVISOR and BC+PPO are worse than RL^2 og and/or RL^2 with longer horizon is much better)
+-- re-run VARIBAD if longer horizon is much better
+
+--- 
+
+implement ant and run all experiments

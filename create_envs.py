@@ -17,6 +17,7 @@ import numpy as np
 from envs.darkroom_env import DarkroomEnv, DarkroomEnvVec
 from envs.keydoor_env import KeyDoorEnv, KeyDoorVecEnv
 from envs.navigation_env import NavigationEnv, NavigationVecEnv
+from envs.ant_env import AntEnv, AntVecEnv, create_ant_envs
 
 
 def _batch_envs(envs, vec_env_class, n_envs):
@@ -199,7 +200,31 @@ def create_navigation_env(env_name, dataset_size, n_envs):
     return train_envs, test_envs, eval_envs
 
 
-def create_env(env_name, dataset_size, n_envs):
+def create_ant_env(env_name, dataset_size, n_envs, num_goals=50, horizon=20):
+    """
+    Create Ant Navigation environments using stable_baselines3 SubprocVecEnv.
+    
+    Args:
+        env_name: "ant" or "ant-navigation"
+        dataset_size: Number of environments to create
+        n_envs: Batch size for vectorized environments
+        num_goals: Number of distinct goals (default: 50)
+        horizon: Steps per episode (default: 20)
+    
+    Returns:
+        train_envs, test_envs, eval_envs: Lists of AntVecEnv instances
+    """
+    return create_ant_envs(
+        num_goals=num_goals,
+        dataset_size=dataset_size,
+        n_envs=n_envs,
+        horizon=horizon,
+        radius=2.0,
+        seed=0
+    )
+
+
+def create_env(env_name, dataset_size, n_envs, **kwargs):
     """
     Create environments based on name.
     
@@ -207,6 +232,7 @@ def create_env(env_name, dataset_size, n_envs):
         env_name: Environment identifier
         dataset_size: Number of environments to create  
         n_envs: Batch size for vectorized environments
+        **kwargs: Additional arguments for specific environments
     
     Returns:
         train_envs, test_envs, eval_envs: Lists of vectorized environments
@@ -217,6 +243,10 @@ def create_env(env_name, dataset_size, n_envs):
         return create_keydoor_env(env_name, dataset_size, n_envs)
     elif "navigation" in env_name:
         return create_navigation_env(env_name, dataset_size, n_envs)
+    elif "ant" in env_name:
+        num_goals = kwargs.get('num_goals', 50)
+        horizon = kwargs.get('horizon', 20)
+        return create_ant_env(env_name, dataset_size, n_envs, num_goals, horizon)
     else:
         raise ValueError(f"Unknown environment: {env_name}")
 

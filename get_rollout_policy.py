@@ -20,8 +20,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class BasePolicy:
     """Base class for rollout policies."""
     
-    def __init__(self):
+    def __init__(self, action_stats=None):
         self.env = None
+        self.action_stats = action_stats
+        if action_stats is not None:
+            self.action_mean = np.array(action_stats['mean'])
+            self.action_std = np.array(action_stats['std'])
+        else:
+            self.action_mean = None
+            self.action_std = None
 
     def set_env(self, env):
         """Set the environment for the policy."""
@@ -38,10 +45,25 @@ class BasePolicy:
     def update_context(self, states, actions, rewards, dones):
         """Update policy context with new transition."""
         pass
+    
+    def denormalize_action(self, action):
+        """Denormalize action for environment execution."""
+        if self.action_mean is not None and self.action_std is not None:
+            return action * self.action_std + self.action_mean
+        return action
+    
+    def normalize_action(self, action):
+        """Normalize action for storage/model input."""
+        if self.action_mean is not None and self.action_std is not None:
+            return (action - self.action_mean) / self.action_std
+        return action
 
 
 class ExpertPolicy(BasePolicy):
     """Policy that returns the optimal action from the environment."""
+
+    def __init__(self, action_stats=None):
+        super().__init__(action_stats)
 
     def get_action(self, states):
         if hasattr(self.env, "have_keys"):
@@ -122,7 +144,7 @@ class TransformerPolicy(BasePolicy):
     """
 
     def __init__(self, model, temp=0.1, context_horizon=None, env_horizon=None, 
-                 sliding_window=True, use_value_guide=False):
+                 sliding_window=True, use_value_guide=False, action_stats=None):
         """
         Args:
             model: Trained Decision Transformer model
@@ -131,6 +153,7 @@ class TransformerPolicy(BasePolicy):
             env_horizon: Steps per episode
             sliding_window: If True, use sliding window for context trimming
             use_value_guide: If True, use value-guided action selection
+            action_stats: Optional dict with 'mean' and 'std' for action denormalization
         """
         super().__init__()
         self.model = model
@@ -140,6 +163,15 @@ class TransformerPolicy(BasePolicy):
         self.sliding_window = sliding_window
         self.use_value_guide = use_value_guide
         self.continuous_action = getattr(model, 'continuous_action', False)
+        
+        # Action normalization stats (for denormalizing output actions)
+        self.action_stats = action_stats
+        if action_stats is not None:
+            self.action_mean = np.array(action_stats['mean'])
+            self.action_std = np.array(action_stats['std'])
+        else:
+            self.action_mean = None
+            self.action_std = None
         
         # Context buffers
         self.context_states = []
@@ -204,6 +236,7 @@ class TransformerPolicy(BasePolicy):
                 action = action_output.mean
             else:
                 action = action_output.sample()
+            # Return normalized action (denormalization happens at execution boundary)
             return action.cpu().numpy()
         else:
             # Handle discrete actions (logits output)
@@ -232,8 +265,8 @@ class HybridPolicy(TransformerPolicy):
     """
 
     def __init__(self, model, temp=0.1, context_horizon=None, env_horizon=None, 
-                 sliding_window=True, beta=0.5):
-        super().__init__(model, temp, context_horizon, env_horizon, sliding_window)
+                 sliding_window=True, beta=0.5, action_stats=None):
+        super().__init__(model, temp, context_horizon, env_horizon, sliding_window, action_stats=action_stats)
         self.expert = ExpertPolicy()
         self.beta = beta
 
@@ -256,8 +289,8 @@ class ContextAccumulationPolicy(TransformerPolicy):
     """
 
     def __init__(self, model, temp=0.1, context_horizon=None, env_horizon=None, 
-                 sliding_window=True, beta=0.0):
-        super().__init__(model, temp, context_horizon, env_horizon, sliding_window)
+                 sliding_window=True, beta=0.0, action_stats=None):
+        super().__init__(model, temp, context_horizon, env_horizon, sliding_window, action_stats=action_stats)
         self.expert = ExpertPolicy()
         self.num_episodes = context_horizon // env_horizon if env_horizon else 1
         self.current_episode = 0
@@ -286,7 +319,8 @@ class ContextAccumulationPolicy(TransformerPolicy):
 
 def get_rollout_policy(policy_type, model=None, temp=1.0, context_horizon=None, 
                        env_horizon=None, sliding_window=False, beta=0.0, 
-                       use_value_guide=False, context_accumulation=False, epsilon=0.25):
+                       use_value_guide=False, context_accumulation=False, epsilon=0.25,
+                       action_stats=None):
     """
     Factory function to create rollout policies.
     
@@ -301,6 +335,7 @@ def get_rollout_policy(policy_type, model=None, temp=1.0, context_horizon=None,
         use_value_guide: Use value-guided action selection
         context_accumulation: If True, use ContextAccumulationPolicy
         epsilon: Probability of random action (for noisy_expert)
+        action_stats: Optional dict with 'mean' and 'std' for action denormalization
     
     Returns:
         Policy instance
@@ -315,11 +350,11 @@ def get_rollout_policy(policy_type, model=None, temp=1.0, context_horizon=None,
 
     if context_accumulation:
         return ContextAccumulationPolicy(
-            model, temp, context_horizon, env_horizon, sliding_window, beta
+            model, temp, context_horizon, env_horizon, sliding_window, beta, action_stats=action_stats
         )
     
     if policy_type == "expert":
-        return ExpertPolicy()
+        return ExpertPolicy(action_stats=action_stats)
     elif policy_type == "random":
         return RandomPolicy()
     elif policy_type == "noisy_expert":
@@ -332,13 +367,13 @@ def get_rollout_policy(policy_type, model=None, temp=1.0, context_horizon=None,
         if model is None:
             raise ValueError("Model required for Transformer policy")
         return TransformerPolicy(
-            model, temp, context_horizon, env_horizon, sliding_window, use_value_guide
+            model, temp, context_horizon, env_horizon, sliding_window, use_value_guide, action_stats=action_stats
         )
     elif policy_type == "hybrid":
         if model is None:
             raise ValueError("Model required for Hybrid policy")
         return HybridPolicy(
-            model, temp, context_horizon, env_horizon, sliding_window, beta
+            model, temp, context_horizon, env_horizon, sliding_window, beta, action_stats=action_stats
         )
     else:
         raise ValueError(f"Unknown policy type: {policy_type}")

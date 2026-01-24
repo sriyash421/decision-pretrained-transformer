@@ -17,6 +17,9 @@ def dagger_rollout(env, rollout_policy, horizon):
     """
     Collect a rollout with expert action labels (DAgger-style).
     
+    Policy outputs normalized actions; we denormalize before env.step.
+    We store RAW (unnormalized) actions; normalization is handled by SequenceDataset.
+    
     Args:
         env: Vectorized environment
         rollout_policy: Policy to collect actions from
@@ -25,8 +28,8 @@ def dagger_rollout(env, rollout_policy, horizon):
     Returns:
         Dictionary with:
         - states: (n_envs, horizon, state_dim)
-        - actions: (n_envs, horizon, action_dim) - policy actions
-        - expert_actions: (n_envs, horizon, action_dim) - expert supervision
+        - actions: (n_envs, horizon, action_dim) - raw (denormalized) policy actions
+        - expert_actions: (n_envs, horizon, action_dim) - raw expert actions
         - rewards: (n_envs, horizon)
         - dones: (n_envs, horizon)
     """
@@ -42,32 +45,35 @@ def dagger_rollout(env, rollout_policy, horizon):
     dones_list = []
 
     for t in range(horizon):
-        # Get policy action
-        action = rollout_policy.get_action(state)
+        # Get policy action (normalized)
+        action_normalized = rollout_policy.get_action(state)
+        
+        # Denormalize action for environment execution
+        action_for_env = rollout_policy.denormalize_action(action_normalized)
         
         # Clip continuous actions if needed
         if hasattr(rollout_policy, "continuous_action") and rollout_policy.continuous_action:
             if hasattr(env, "action_space"):
-                action = np.clip(action, env.action_space.low, env.action_space.high)
+                action_for_env = np.clip(action_for_env, env.action_space.low, env.action_space.high)
         
-        # Get expert action for supervision
+        # Get expert action for supervision (raw from environment)
         if hasattr(env, "have_keys"):
-            expert_action = env.opt_action(state, env.have_keys)
+            expert_action_raw = env.opt_action(state, env.have_keys)
         else:
-            expert_action = env.opt_action(state)
+            expert_action_raw = env.opt_action(state)
 
-        # Step environment
-        next_state, reward, done, _ = env.step(action)
+        # Step environment with denormalized action
+        next_state, reward, done, _ = env.step(action_for_env)
         
-        # Store transition
+        # Store RAW actions (normalization is done by SequenceDataset)
         states.append(state)
-        actions.append(action)
-        expert_actions.append(expert_action)
+        actions.append(action_for_env)  # Store denormalized (raw) action
+        expert_actions.append(expert_action_raw)  # Store raw expert action
         rewards.append(reward)
         dones_list.append(done)
         
-        # Update policy context
-        rollout_policy.update_context(state, action, reward, done)
+        # Update policy context with normalized actions (for policy's internal use)
+        rollout_policy.update_context(state, action_normalized, reward, done)
         
         # Handle episode resets
         if np.any(done):
@@ -112,19 +118,65 @@ def get_dagger_data(envs, rollout_policy, horizon):
         n_envs = env.num_envs
         
         for k in range(n_envs):
+            # Get goal - handle both direct _goals array (SubprocVecEnv) and nested _envs
+            if hasattr(env, '_goals'):
+                goal = env._goals[k]
+            elif hasattr(env, '_envs') and env._envs[k] is not None:
+                goal = env._envs[k].goal
+            else:
+                goal = None
+            
             traj = {
                 "states": data["states"][k],
                 "actions": data["actions"][k],
                 "expert_actions": data["expert_actions"][k],
                 "rewards": data["rewards"][k],
                 "dones": data["dones"][k],
-                "goal": env._envs[k].goal,
+                "goal": goal,
             }
             trajs.append(traj)
     return trajs
 
 
-def get_dagger_dataset(train_envs, test_envs, rollout_policy, horizon):
+def get_eval_data(envs, rollout_policy, horizon):
+    """
+    Collect evaluation data from multiple environments (no expert actions).
+    
+    Args:
+        envs: List of vectorized environments
+        rollout_policy: Policy for data collection
+        horizon: Steps per environment
+    
+    Returns:
+        List of trajectory dictionaries
+    """
+    trajs = []
+    for env in tqdm.tqdm(envs, desc="Collecting eval data"):
+        data = eval_rollout(env, rollout_policy, horizon)
+        n_envs = env.num_envs
+        
+        for k in range(n_envs):
+            # Get goal - handle both direct _goals array (SubprocVecEnv) and nested _envs
+            if hasattr(env, '_goals'):
+                goal = env._goals[k]
+            elif hasattr(env, '_envs') and env._envs[k] is not None:
+                goal = env._envs[k].goal
+            else:
+                goal = None
+            
+            traj = {
+                "states": data["states"][k],
+                "actions": data["actions"][k],
+                "rewards": data["rewards"][k],
+                "dones": data["dones"][k],
+                "goal": goal,
+            }
+            trajs.append(traj)
+    return trajs
+
+
+def get_dagger_dataset(train_envs, test_envs, rollout_policy, horizon, 
+                       normalize_actions=False, action_stats=None):
     """
     Create train and test datasets using DAgger-style collection.
     
@@ -133,6 +185,9 @@ def get_dagger_dataset(train_envs, test_envs, rollout_policy, horizon):
         test_envs: List of test environments  
         rollout_policy: Policy for data collection
         horizon: Steps per environment
+        normalize_actions: Whether to normalize actions
+        action_stats: Optional dict with 'mean' and 'std'. If None and 
+                     normalize_actions=True, compute from training data.
     
     Returns:
         train_dataset, test_dataset: SequenceDataset instances
@@ -149,8 +204,21 @@ def get_dagger_dataset(train_envs, test_envs, rollout_policy, horizon):
         "action_dim": train_envs[0].action_dim
     }
     
-    train_dataset = SequenceDataset(train_trajs, {**config, "shuffle": True})
-    test_dataset = SequenceDataset(test_trajs, {**config, "shuffle": False})
+    # Create train dataset (computes action stats if needed)
+    train_dataset = SequenceDataset(
+        train_trajs, 
+        {**config, "shuffle": True},
+        action_stats=action_stats,
+        normalize_actions=normalize_actions,
+    )
+    
+    # Use same action stats for test dataset
+    test_dataset = SequenceDataset(
+        test_trajs, 
+        {**config, "shuffle": False},
+        action_stats=train_dataset.get_action_stats(),  # Use train stats!
+        normalize_actions=normalize_actions,
+    )
     
     return train_dataset, test_dataset
 
@@ -159,16 +227,23 @@ def merge_sequence_datasets(dataset1, dataset2):
     """
     Merge two SequenceDatasets.
     
+    Preserves action stats from the first dataset (important for DAgger iterations).
+    
     Args:
-        dataset1: First dataset
+        dataset1: First dataset (action stats are taken from here)
         dataset2: Second dataset
     
     Returns:
-        Merged SequenceDataset
+        Merged SequenceDataset with action stats from dataset1
     """
     from dataset import SequenceDataset
     merged_trajs = dataset1.trajs + dataset2.trajs
-    return SequenceDataset(merged_trajs, dataset1.config)
+    return SequenceDataset(
+        merged_trajs, 
+        dataset1.config,
+        action_stats=dataset1.get_action_stats(),  # Preserve original stats!
+        normalize_actions=dataset1.normalize_actions,
+    )
 
 
 def merge_trajs(trajs):
@@ -234,6 +309,75 @@ def load_data(load_path):
         return pickle.load(f)
 
 
+def eval_rollout(env, rollout_policy, horizon):
+    """
+    Collect a rollout for evaluation (no expert actions needed).
+    
+    Denormalizes policy actions before env.step.
+    
+    Args:
+        env: Vectorized environment
+        rollout_policy: Policy to collect actions from
+        horizon: Number of steps to collect
+    
+    Returns:
+        Dictionary with:
+        - states: (n_envs, horizon, state_dim)
+        - actions: (n_envs, horizon, action_dim) - raw (denormalized) actions
+        - rewards: (n_envs, horizon)
+        - dones: (n_envs, horizon)
+    """
+    rollout_policy.set_env(env)
+    state = env.reset()
+    rollout_policy.reset()
+    n_envs = env.num_envs
+    
+    states = []
+    actions = []
+    rewards = []
+    dones_list = []
+
+    for t in range(horizon):
+        # Get policy action (normalized)
+        action_normalized = rollout_policy.get_action(state)
+        
+        # Denormalize action for environment execution
+        action_for_env = rollout_policy.denormalize_action(action_normalized)
+        
+        # Clip continuous actions if needed
+        if hasattr(rollout_policy, "continuous_action") and rollout_policy.continuous_action:
+            if hasattr(env, "action_space"):
+                action_for_env = np.clip(action_for_env, env.action_space.low, env.action_space.high)
+
+        # Step environment with denormalized action
+        next_state, reward, done, _ = env.step(action_for_env)
+        
+        # Store raw (denormalized) actions
+        states.append(state)
+        actions.append(action_for_env)  # Store denormalized action for eval logging
+        rewards.append(reward)
+        dones_list.append(done)
+        
+        # Update policy context with normalized actions (for policy's internal use)
+        rollout_policy.update_context(state, action_normalized, reward, done)
+        
+        # Handle episode resets
+        if np.any(done):
+            next_state = env.reset()
+        
+        state = next_state
+
+    # Stack arrays
+    data = {
+        "states": np.stack(states, axis=1),
+        "actions": np.stack(actions, axis=1),
+        "rewards": np.stack(rewards, axis=1),
+        "dones": np.stack(dones_list, axis=1),
+    }
+    
+    return data
+
+
 def evaluate_policy(envs, policy, horizon, env_horizon):
     """
     Evaluate a policy and compute episode returns.
@@ -255,7 +399,7 @@ def evaluate_policy(envs, policy, horizon, env_horizon):
     all_step_rewards = []
     
     for env in tqdm.tqdm(envs, desc="Evaluating"):
-        data = dagger_rollout(env, policy, horizon)
+        data = eval_rollout(env, policy, horizon)
         rewards = data["rewards"]
         dones = data["dones"]
         

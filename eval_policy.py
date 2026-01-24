@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from create_envs import create_env
-from collect_data import get_dagger_data, save_dagger_data
+from collect_data import get_eval_data
 from get_rollout_policy import get_rollout_policy
 from models import DecisionTransformer
 
@@ -147,8 +147,11 @@ def evaluate_policy_on_envs(
     os.makedirs(save_dir, exist_ok=True)
     
     # Collect trajectories (returns list of trajectory dicts)
-    eval_trajs = get_dagger_data(eval_envs, policy, eval_horizon)
-    save_dagger_data(eval_trajs, os.path.join(save_dir, 'eval_trajs.pkl'))
+    eval_trajs = get_eval_data(eval_envs, policy, eval_horizon)
+    
+    # Save eval trajectories directly (they don't have expert_actions)
+    with open(os.path.join(save_dir, 'eval_trajs.pkl'), 'wb') as f:
+        pickle.dump(eval_trajs, f)
     
     # Extract rewards from trajectory list and stack into (B, T) array
     rewards = np.stack([traj['rewards'] for traj in eval_trajs])

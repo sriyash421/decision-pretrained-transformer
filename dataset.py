@@ -166,24 +166,73 @@ class SequenceDataset(torch.utils.data.Dataset):
     
     Each item contains a full trajectory with states, actions, 
     expert_actions, rewards, and dones.
+    
+    Supports optional action normalization (zero mean, unit variance).
     """
 
-    def __init__(self, trajs, config):
+    def __init__(self, trajs, config, action_stats=None, normalize_actions=False):
+        """
+        Args:
+            trajs: List of trajectory dictionaries
+            config: Dataset configuration
+            action_stats: Optional dict with 'mean' and 'std' for normalization.
+                         If None and normalize_actions=True, compute from this data.
+            normalize_actions: Whether to normalize actions
+        """
         self.shuffle = config['shuffle']
         self.horizon = config['horizon']
         self.store_gpu = config.get('store_gpu', False)
         self.config = config
         self.trajs = trajs
+        self.normalize_actions = normalize_actions
+        
+        # Compute or use provided action stats
+        if normalize_actions:
+            if action_stats is not None:
+                self.action_mean = action_stats['mean']
+                self.action_std = action_stats['std']
+            else:
+                # Compute stats from this dataset
+                all_actions = np.concatenate([t['expert_actions'] for t in trajs], axis=0)
+                self.action_mean = np.mean(all_actions, axis=0)
+                self.action_std = np.std(all_actions, axis=0) + 1e-8  # Prevent division by zero
+            
+            self.action_stats = {
+                'mean': self.action_mean,
+                'std': self.action_std,
+            }
+        else:
+            self.action_stats = None
+            self.action_mean = None
+            self.action_std = None
+    
+    def get_action_stats(self):
+        """Return action normalization stats (for use in subsequent iterations)."""
+        return self.action_stats
+    
+    def _normalize_action(self, action):
+        """Normalize action to zero mean, unit variance."""
+        if self.normalize_actions and self.action_mean is not None:
+            return (action - self.action_mean) / self.action_std
+        return action
     
     def __len__(self):
         return len(self.trajs)
 
     def __getitem__(self, index):
         traj = self.trajs[index]
+        
+        # Only normalize expert_actions (supervision targets), not input actions
+        # Input actions are raw actions taken in the environment
+        actions = traj['actions']
+        expert_actions = traj['expert_actions']
+        if self.normalize_actions:
+            expert_actions = self._normalize_action(expert_actions)
+        
         res = {
             'states': convert_to_tensor(traj['states'], store_gpu=self.store_gpu),
-            'actions': convert_to_tensor(traj['actions'], store_gpu=self.store_gpu),
-            'expert_actions': convert_to_tensor(traj['expert_actions'], store_gpu=self.store_gpu),
+            'actions': convert_to_tensor(actions, store_gpu=self.store_gpu),
+            'expert_actions': convert_to_tensor(expert_actions, store_gpu=self.store_gpu),
             'rewards': convert_to_tensor(traj['rewards'], store_gpu=self.store_gpu),
             'dones': convert_to_tensor(traj['dones'], store_gpu=self.store_gpu),
         }

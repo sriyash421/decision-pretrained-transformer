@@ -118,21 +118,29 @@ def train_step(
     best_model = None
     
     def forward(batch):
-        """Compute loss for a batch (discrete actions only)."""
+        """Compute loss for a batch (supports both discrete and continuous actions)."""
         batch = {k: v.to(device) for k, v in batch.items()}
         true_actions = batch["expert_actions"]
-        pred_actions, _ = model(batch)
-        
-        # Cross entropy loss for discrete actions
-        action_loss = F.cross_entropy(
-            pred_actions.reshape(-1, action_dim),
-            true_actions.reshape(-1, action_dim),
-            reduction='none'
-        )
+        pred_output, _ = model(batch)
         
         # Apply loss mask to only compute loss on last env_horizon tokens
         loss_mask = get_loss_mask(batch['attention_mask'], env_horizon)
-        loss = (action_loss.reshape(batch['attention_mask'].shape) * loss_mask).sum() / loss_mask.sum()
+        
+        if args.continuous_action:
+            # Negative log likelihood loss for continuous actions (Gaussian distribution)
+            # pred_output is a distribution with Independent wrapper, 
+            # so log_prob already sums over action dimensions -> (B, T)
+            log_prob = pred_output.log_prob(true_actions)  # (B, T) since Independent sums over action dim
+            action_loss = -log_prob  # NLL
+            loss = (action_loss * loss_mask).sum() / loss_mask.sum()
+        else:
+            # Cross entropy loss for discrete actions
+            action_loss = F.cross_entropy(
+                pred_output.reshape(-1, action_dim),
+                true_actions.reshape(-1, action_dim),
+                reduction='none'
+            )
+            loss = (action_loss.reshape(batch['attention_mask'].shape) * loss_mask).sum() / loss_mask.sum()
         
         return loss, {"loss": loss.item()}
     
@@ -210,7 +218,8 @@ def train_step(
     return model
 
 
-def data_step(save_dir, step_id, train_envs, test_envs, rollout_policy, horizon):
+def data_step(save_dir, step_id, train_envs, test_envs, rollout_policy, horizon,
+               normalize_actions=False, action_stats=None):
     """
     Collect data for one DAgger step.
     
@@ -221,6 +230,8 @@ def data_step(save_dir, step_id, train_envs, test_envs, rollout_policy, horizon)
         test_envs: Test environments
         rollout_policy: Policy to use for data collection
         horizon: Horizon for data collection
+        normalize_actions: Whether to normalize actions
+        action_stats: Optional action stats from first iteration (mean, std)
     
     Returns:
         train_dataset, test_dataset
@@ -238,10 +249,22 @@ def data_step(save_dir, step_id, train_envs, test_envs, rollout_policy, horizon)
             train_dataset = pickle.load(f)
         with open(test_path, "rb") as f:
             test_dataset = pickle.load(f)
+        # Re-apply normalization with provided stats if needed
+        if normalize_actions and action_stats is not None:
+            train_dataset.action_stats = action_stats
+            train_dataset.action_mean = action_stats['mean']
+            train_dataset.action_std = action_stats['std']
+            train_dataset.normalize_actions = True
+            test_dataset.action_stats = action_stats
+            test_dataset.action_mean = action_stats['mean']
+            test_dataset.action_std = action_stats['std']
+            test_dataset.normalize_actions = True
     else:
         print(f"Collecting new data for step {step_id}")
         train_dataset, test_dataset = get_dagger_dataset(
-            train_envs, test_envs, rollout_policy, horizon
+            train_envs, test_envs, rollout_policy, horizon,
+            normalize_actions=normalize_actions,
+            action_stats=action_stats
         )
         with open(train_path, "wb") as f:
             pickle.dump(train_dataset, f)
@@ -290,6 +313,12 @@ if __name__ == "__main__":
     
     # Paths
     parser.add_argument("--save_dir", type=str, default="./context_results")
+    
+    # Ant-specific arguments
+    parser.add_argument("--continuous_action", action="store_true", help="Use continuous actions (for ant env)")
+    parser.add_argument("--num_goals", type=int, default=50, help="Number of goals for ant env")
+    parser.add_argument("--horizon", type=int, default=None, help="Environment horizon (overrides default)")
+    parser.add_argument("--normalize_actions", action="store_true", help="Normalize actions (for continuous envs)")
 
     args = parser.parse_args()
 
@@ -321,15 +350,29 @@ if __name__ == "__main__":
 
     # Create environments
     print(f"Creating environments: {args.env_name}")
-    train_envs, test_envs, eval_envs = create_env(args.env_name, args.dataset_size, args.n_envs)
+    env_kwargs = {}
+    if "ant" in args.env_name:
+        env_kwargs['num_goals'] = args.num_goals
+        if args.horizon:
+            env_kwargs['horizon'] = args.horizon
+    train_envs, test_envs, eval_envs = create_env(args.env_name, args.dataset_size, args.n_envs, **env_kwargs)
     
-    state_dim = train_envs[0]._envs[0].state_dim
-    action_dim = train_envs[0]._envs[0].action_dim
-    env_horizon = train_envs[0]._envs[0].horizon
+    # Get dimensions - try direct attributes first, then nested _envs
+    env = train_envs[0]
+    if hasattr(env, 'state_dim'):
+        state_dim = env.state_dim
+        action_dim = env.action_dim
+        env_horizon = env.horizon
+    elif hasattr(env, '_envs') and env._envs and env._envs[0] is not None:
+        state_dim = env._envs[0].state_dim
+        action_dim = env._envs[0].action_dim
+        env_horizon = env._envs[0].horizon
+    else:
+        raise ValueError("Could not determine state_dim/action_dim from environment")
     
     print(f"State dim: {state_dim}, Action dim: {action_dim}, Env horizon: {env_horizon}")
 
-    # Model configuration (discrete actions only)
+    # Model configuration
     model_horizon = env_horizon * args.dagger_steps
     model_args = {
         "horizon": model_horizon,
@@ -341,8 +384,12 @@ if __name__ == "__main__":
         "dropout": args.dropout,
         "shuffle": True,
         "test": False,
-        "continuous_action": False,
+        "continuous_action": args.continuous_action,
         "gmm_heads": 1,
+        # Continuous action settings (following robomimic)
+        "tanh_action": False,  # We use tanh on mean directly
+        "low_noise_eval": True,  # Use low noise at eval time
+        # std_min, std_max, init_std use robomimic defaults: (0.007, 7.5, 0.3)
     }
     
     with open(os.path.join(save_dir, "model_args.pkl"), "wb") as f:
@@ -355,9 +402,18 @@ if __name__ == "__main__":
     # Initial data collection with expert
     init_rollout_policy = get_rollout_policy("expert")
     train_dataset, test_dataset = data_step(
-        save_dir, 0, train_envs, test_envs, init_rollout_policy, env_horizon
+        save_dir, 0, train_envs, test_envs, init_rollout_policy, env_horizon,
+        normalize_actions=args.normalize_actions,
+        action_stats=None,  # Compute from first iteration data
     )
     current_horizon = env_horizon
+    
+    # Save action stats from first iteration (used for all subsequent iterations)
+    action_stats = train_dataset.get_action_stats()
+    if action_stats is not None:
+        print(f"Action normalization stats - Mean: {action_stats['mean']}, Std: {action_stats['std']}")
+        with open(os.path.join(save_dir, "action_stats.pkl"), "wb") as f:
+            pickle.dump(action_stats, f)
 
     # Compute total training steps for scheduler (reset each iteration)
     total_steps = len(train_dataset) // args.batch_size * args.num_epochs
@@ -410,6 +466,7 @@ if __name__ == "__main__":
             env_horizon=env_horizon,
             context_accumulation=False,  # Pure learned policy for evaluation
             sliding_window=True if "nonepisodic" in args.env_name else False,
+            action_stats=action_stats,  # Pass action stats for denormalization
         )
         
         eval_save_dir = os.path.join(save_dir, f"dagger_step_{step_idx}", "eval")
@@ -472,15 +529,18 @@ if __name__ == "__main__":
             context_horizon=current_horizon,
             env_horizon=env_horizon,
             context_accumulation=True,
+            action_stats=action_stats,  # Pass action stats for denormalization
         )
         
         # Collect new data and merge (if not last step)
         if step_idx < args.dagger_steps - 1:
             step_train_dataset, step_test_dataset = data_step(
-                save_dir, step_idx + 1, train_envs, test_envs, step_policy, current_horizon
+                save_dir, step_idx + 1, train_envs, test_envs, step_policy, current_horizon,
+                normalize_actions=args.normalize_actions,
+                action_stats=action_stats,  # Use stats from first iteration!
             )
             
-            # Always merge with previous datasets
+            # Always merge with previous datasets (preserves original action stats)
             train_dataset = merge_sequence_datasets(train_dataset, step_train_dataset)
             test_dataset = merge_sequence_datasets(test_dataset, step_test_dataset)
             
