@@ -364,7 +364,7 @@ class AntVecEnv:
         self._vec_env.close()
 
 
-def create_ant_envs(num_goals=50, dataset_size=1000, n_envs=100, horizon=20, radius=2.0, seed=42):
+def create_ant_envs(num_goals=50, dataset_size=1000, n_envs=100, horizon=20, radius=2.0, seed=42, expert_path=None, eval_only=False):
     """
     Create Ant environments for training and testing.
     
@@ -381,6 +381,7 @@ def create_ant_envs(num_goals=50, dataset_size=1000, n_envs=100, horizon=20, rad
         horizon: Steps per episode
         radius: Radius for goal sampling on semicircle
         seed: Random seed for goal generation
+        expert_path: Path to expert model (default: EXPERT_PATH)
     
     Returns:
         train_envs, test_envs, eval_envs: Lists containing single AntVecEnv each
@@ -392,10 +393,14 @@ def create_ant_envs(num_goals=50, dataset_size=1000, n_envs=100, horizon=20, rad
     goals = np.array([[radius * np.cos(a), radius * np.sin(a)] for a in angles])
     
     # Shuffle and split 80/20
-    np.random.shuffle(goals)
-    split_idx = int(0.8 * len(goals))
-    train_goals = goals[:split_idx]  # 80% for train
-    test_goals = goals[split_idx:]    # 20% for test
+    if num_goals < 10:
+        train_goals = goals
+        test_goals = goals
+    else:
+        np.random.shuffle(goals)
+        split_idx = int(0.8 * len(goals))
+        train_goals = goals[:split_idx]  # 80% for train
+        test_goals = goals[split_idx:]    # 20% for test
     
     print(f"Generated {num_goals} goals: {len(train_goals)} train, {len(test_goals)} test")
     
@@ -413,19 +418,25 @@ def create_ant_envs(num_goals=50, dataset_size=1000, n_envs=100, horizon=20, rad
     print(f"Expanded to {len(train_goals_expanded)} train envs, {len(test_goals_expanded)} test envs")
     
     # Load expert model once (shared across all envs)
-    print(f"Loading SAC expert from {EXPERT_PATH}")
-    expert_model = SAC.load(EXPERT_PATH)
-    
+    expert_path = expert_path or EXPERT_PATH
+    print(f"Loading SAC expert from {expert_path}")
+    expert_model = SAC.load(expert_path)
+    train_env = None
+    test_env = None
+    eval_env = None
+    num_envs = 1
     # Create vectorized environments
-    print("Creating train environments...")
-    train_env = AntVecEnv(train_goals_expanded, horizon, expert_model)
+    if not eval_only:
+        print("Creating train environments...")
+        train_env = AntVecEnv(train_goals_expanded, horizon, expert_model)
     
-    print("Creating test environments...")
-    test_env = AntVecEnv(test_goals_expanded, horizon, expert_model)
-    
+        print("Creating test environments...")
+        test_env = AntVecEnv(test_goals_expanded, horizon, expert_model)
+        num_envs = dataset_size // n_envs
+    # else:
     print("Creating eval environments...")
     eval_env = AntVecEnv(test_goals_expanded, horizon, expert_model)
     
     # Return as lists (for compatibility with existing code that iterates over env batches)
-    num_envs = dataset_size // horizon
+    num_envs = dataset_size // n_envs
     return [train_env] * num_envs, [test_env] * num_envs, [eval_env] * num_envs

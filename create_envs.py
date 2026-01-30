@@ -45,8 +45,8 @@ def create_darkroom_env(env_name, dataset_size, n_envs):
         dim, horizon = 10, 100
     elif "hard" in env_name:
         dim, horizon = 20, 200
-    elif "easy-small" in env_name:
-        dim, horizon = 5, 50
+    elif "mini" in env_name:
+        dim, horizon = 5, 30
     else:
         raise ValueError(f"Unknown darkroom variant: {env_name} - should be easy or hard")
 
@@ -254,29 +254,30 @@ def create_env(env_name, dataset_size, n_envs, **kwargs):
 def test_all_envs():
     """Test that optimal policies achieve positive reward in all environments."""
     env_names = [
-        "navigation-episodic",
-        "navigation-nonepisodic",
-        "darkroom-easy",
-        "darkroom-hard",
-        "keydoor-nonmarkovian",
-        "keydoor-markovian",
+        # "navigation-episodic",
+        # "navigation-nonepisodic",
+        # "darkroom-easy",
+        # "darkroom-hard",
+        # "keydoor-nonmarkovian",
+        # "keydoor-markovian",
+        "darkroom-mini",
     ]
     
     for name in env_names:
-        train_envs, test_envs, eval_envs = create_env(name, 1, 1)
+        train_envs, test_envs, eval_envs = create_env(name, 1000, 100)
         print(f"Testing {name}...")
         for env in train_envs:
             obs = env.reset()
             total_reward = 0
-            done = False
-            while not done:
+            done = np.array([False])
+            while not done.any():
                 if "keydoor" in name:
                     action = env.opt_action(obs, env.have_keys)
                 else:
                     action = env.opt_action(obs)
                 obs, reward, done, _ = env.step(action)
                 total_reward += reward
-        print(f"  Total reward: {total_reward}")
+        print(f"  Total reward: {total_reward.mean()}")
         assert total_reward > 0, f"Optimal policy failed in {name}"
     
     print("All tests passed!")

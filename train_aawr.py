@@ -114,6 +114,14 @@ def collect_aawr_data(envs, horizon, epsilon=0.25):
         
         # Create trajectory dicts with goal info
         for k in range(n_envs):
+            # Handle different goal access patterns
+            if hasattr(env, '_goals'):
+                # Ant env uses _goals array
+                goal = env._goals[k].copy()
+            else:
+                # Darkroom env uses _envs[k].goal
+                goal = env._envs[k].goal.copy()
+            
             traj = {
                 "states": states[k],
                 "actions": actions[k],
@@ -121,7 +129,7 @@ def collect_aawr_data(envs, horizon, epsilon=0.25):
                 "rewards": rewards[k],
                 "dones": dones[k],
                 "next_states": next_states[k],
-                "goal": env._envs[k].goal.copy(),  # Privileged info
+                "goal": goal,  # Privileged info
             }
             trajs.append(traj)
     
@@ -339,7 +347,7 @@ def train_iql_critic(
 
 
 # ============================================================================
-# AWR Policy Training
+# Joint Critic + Policy Training
 # ============================================================================
 
 def get_loss_mask(attention_mask, horizon):
@@ -356,7 +364,7 @@ def get_loss_mask(attention_mask, horizon):
     return loss_mask
 
 
-def train_awr_policy(
+def train_aawr_joint(
     model,
     critic,
     train_loader,
@@ -364,135 +372,214 @@ def train_awr_policy(
     save_dir,
     action_dim,
     env_horizon,
+    continuous_action=False,
 ):
     """
-    Train policy using Advantage Weighted Regression (AWR).
+    Joint training of critic (IQL) and policy (AWR) for specified gradient steps.
     
-    AWR: weight = exp(A / temperature), where A = Q(s,a,g) - V(s,g)
-    Policy loss: weighted cross-entropy with expert actions
+    Each gradient step:
+    1. Update critic with IQL (V-network expectile loss + Q-network TD loss)
+    2. Update policy with AWR (advantage-weighted BC)
     
     Args:
         model: Policy model (DecisionTransformer)
-        critic: Trained AsymmetricCritic (frozen)
+        critic: AsymmetricCritic model
         train_loader: DataLoader with AAWR dataset
         args: Training arguments
         save_dir: Directory to save checkpoints
         action_dim: Action dimension
         env_horizon: Environment horizon
+        continuous_action: Whether actions are continuous
     
     Returns:
-        Trained policy
+        Trained model and critic
     """
     os.makedirs(save_dir, exist_ok=True)
     
-    # Freeze critic
-    critic.eval()
-    for param in critic.parameters():
-        param.requires_grad = False
+    # Initialize critic target network
+    critic.init_target()
     
-    # Setup optimizer with warmup
-    total_steps = len(train_loader) * args.policy_epochs
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    warmup_steps = int(total_steps * args.warmup_ratio)
+    # Setup optimizers
+    critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=args.critic_lr)
+    policy_optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
+    # Setup scheduler for policy
+    warmup_steps = int(args.total_gradient_steps * args.warmup_ratio)
     warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+        policy_optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
     )
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, total_steps - warmup_steps)
+        policy_optimizer, T_max=max(1, args.total_gradient_steps - warmup_steps)
     )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, [warmup, cosine], milestones=[warmup_steps]
+    policy_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        policy_optimizer, [warmup, cosine], milestones=[warmup_steps]
     )
     
-    eval_freq = max(1, int(args.eval_interval * args.policy_epochs))
-    save_freq = max(1, int(args.save_interval * args.policy_epochs))
+    # Training loop
+    global_step = 0
+    data_iter = iter(train_loader)
     
-    for epoch in tqdm.tqdm(range(args.policy_epochs), desc="Training AWR Policy"):
-        model.train()
-        epoch_stats = defaultdict(list)
+    log_freq = max(1, args.total_gradient_steps // 100)
+    save_freq = max(1, args.total_gradient_steps // 10)
+    
+    pbar = tqdm.tqdm(total=args.total_gradient_steps, desc="Training AAWR (joint)")
+    
+    while global_step < args.total_gradient_steps:
+        # Get batch (cycle through dataset)
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(train_loader)
+            batch = next(data_iter)
         
-        for batch in train_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(device) for k, v in batch.items()}
+        
+        B, T = batch['states'].shape[:2]
+        mask = batch['attention_mask']
+        goal_expanded = batch['goal'].unsqueeze(1).expand(-1, T, -1)
+        
+        # Flatten tensors for critic
+        states_flat = batch['states'].reshape(-1, batch['states'].shape[-1])
+        actions_flat = batch['actions'].reshape(-1, batch['actions'].shape[-1])
+        next_states_flat = batch['next_states'].reshape(-1, batch['next_states'].shape[-1])
+        rewards_flat = batch['rewards'].reshape(-1)
+        dones_flat = batch['dones'].reshape(-1)
+        goal_flat = goal_expanded.reshape(-1, goal_expanded.shape[-1])
+        mask_flat = mask.reshape(-1)
+        
+        valid_idx = mask_flat > 0
+        if valid_idx.sum() == 0:
+            continue
+        
+        states = states_flat[valid_idx]
+        actions = actions_flat[valid_idx]
+        next_states = next_states_flat[valid_idx]
+        rewards = rewards_flat[valid_idx]
+        dones = dones_flat[valid_idx]
+        goals = goal_flat[valid_idx]
+        
+        # ==================== Critic Update (IQL) ====================
+        critic.train()
+        
+        # V-network: expectile regression on Q values
+        with torch.no_grad():
+            q_values = critic.q_value(states, actions, goals).squeeze(-1)
+        
+        v_values = critic.v_value(states, goals).squeeze(-1)
+        v_loss = expectile_loss(v_values, q_values, args.expectile)
+        
+        # Q-network: TD loss
+        with torch.no_grad():
+            next_v = critic.v_value(next_states, goals).squeeze(-1)
+            q_target = rewards + args.gamma * next_v * (1 - dones)
+        
+        q_pred = critic.q_value(states, actions, goals).squeeze(-1)
+        q_loss = F.mse_loss(q_pred, q_target)
+        
+        critic_loss = v_loss + q_loss
+        
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        if args.gradient_clip:
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+        critic_optimizer.step()
+        
+        # Update target network
+        critic.update_target(tau=args.target_tau)
+        
+        # ==================== Policy Update (AWR) ====================
+        model.train()
+        critic.eval()
+        
+        # Get policy predictions
+        pred_actions, pred_stds = model(batch, sample_time=False)
+        true_actions = batch['expert_actions']
+        
+        # Compute advantages using critic (no grad)
+        with torch.no_grad():
+            advantages = critic.advantage(states_flat[valid_idx], actions_flat[valid_idx], goal_flat[valid_idx])
+            # Map back to (B, T) shape
+            adv_full = torch.zeros(B * T, device=device)
+            adv_full[valid_idx] = advantages
+            advantages_2d = adv_full.reshape(B, T)
             
-            # Get policy predictions
-            pred_actions, _ = model(batch, sample_time=True)
-            true_actions = batch['expert_actions']
+            # AWR weights
+            advantages_clipped = torch.clamp(advantages_2d / args.awr_temperature, -10, 10)
+            weights = torch.exp(advantages_clipped)
             
-            # Compute advantages using frozen critic
-            B, T = batch['states'].shape[:2]
-            goal_expanded = batch['goal'].unsqueeze(1).expand(-1, T, -1)
-            
-            with torch.no_grad():
-                # Flatten for critic
-                states_flat = batch['states'].reshape(-1, batch['states'].shape[-1])
-                actions_flat = batch['actions'].reshape(-1, batch['actions'].shape[-1])
-                goal_flat = goal_expanded.reshape(-1, goal_expanded.shape[-1])
-                
-                # Compute advantages
-                advantages = critic.advantage(states_flat, actions_flat, goal_flat)
-                advantages = advantages.reshape(B, T)  # (B, T)
-                
-                # Compute AWR weights: w = exp(A / temperature)
-                # Clip advantages for numerical stability
-                advantages_clipped = torch.clamp(advantages / args.awr_temperature, -10, 10)
-                weights = torch.exp(advantages_clipped)
-                
-                # Optional: use indicator filter (only positive advantages)
-                if args.awr_filter == "indicator":
-                    weights = (advantages > 0).float()
-                elif args.awr_filter == "exp_clamp":
-                    weights = torch.clamp(weights, 0, 100)
-            
+            if args.awr_filter == "indicator":
+                weights = (advantages_2d > 0).float()
+            elif args.awr_filter == "exp_clamp":
+                weights = torch.clamp(weights, 0, 100)
+        
+        # Compute action loss
+        if continuous_action:
+            # Gaussian NLL loss for continuous actions
+            diff = true_actions - pred_actions
+            var = pred_stds ** 2 + 1e-6
+            nll = 0.5 * (diff ** 2 / var) + torch.log(pred_stds + 1e-6)
+            action_loss = nll.sum(-1)  # Sum over action dims -> (B, T)
+        else:
             # Cross entropy loss for discrete actions
+            # pred_actions: (B, T, action_dim) logits
+            # true_actions: (B, T) indices OR (B, T, 1) indices
+            if len(true_actions.shape) == 3:
+                true_actions = true_actions.squeeze(-1)
             action_loss = F.cross_entropy(
                 pred_actions.reshape(-1, action_dim),
-                true_actions.reshape(-1, action_dim),
+                true_actions.reshape(-1).long(),
                 reduction='none'
             )
             action_loss = action_loss.reshape(B, T)
-            
-            # Apply loss mask (only last env_horizon tokens)
-            loss_mask = get_loss_mask(batch['attention_mask'], env_horizon)
-            
-            # Weighted loss
-            weighted_loss = action_loss * weights * loss_mask
-            loss = weighted_loss.sum() / loss_mask.sum()
-            
-            # Update
-            optimizer.zero_grad()
-            loss.backward()
-            
-            if args.gradient_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
-            optimizer.step()
-            scheduler.step()
-            
-            # Log stats
-            epoch_stats['loss'].append(loss.item())
-            epoch_stats['advantage_mean'].append(advantages.mean().item())
-            epoch_stats['advantage_std'].append(advantages.std().item())
-            epoch_stats['weight_mean'].append(weights.mean().item())
         
-        # Log epoch stats
-        if args.log_wandb:
-            for k, v in epoch_stats.items():
-                wandb.log({f"awr/{k}": np.mean(v), "awr/epoch": epoch})
-            wandb.log({"awr/lr": optimizer.param_groups[0]['lr']})
+        # Apply loss mask
+        loss_mask = get_loss_mask(batch['attention_mask'], env_horizon).float()
         
-        if epoch % eval_freq == 0:
-            print(f"Epoch {epoch}: loss={np.mean(epoch_stats['loss']):.4f}, "
-                  f"adv_mean={np.mean(epoch_stats['advantage_mean']):.4f}")
+        # Weighted loss
+        weighted_loss = action_loss * weights * loss_mask
+        policy_loss = weighted_loss.sum() / (loss_mask.sum() + 1e-8)
+        
+        policy_optimizer.zero_grad()
+        policy_loss.backward()
+        if args.gradient_clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        policy_optimizer.step()
+        policy_scheduler.step()
+        
+        global_step += 1
+        pbar.update(1)
+        
+        # Logging
+        if global_step % log_freq == 0:
+            if args.log_wandb:
+                wandb.log({
+                    "train/critic_loss": critic_loss.item(),
+                    "train/v_loss": v_loss.item(),
+                    "train/q_loss": q_loss.item(),
+                    "train/policy_loss": policy_loss.item(),
+                    "train/advantage_mean": advantages.mean().item(),
+                    "train/weight_mean": weights.mean().item(),
+                    "train/lr": policy_optimizer.param_groups[0]['lr'],
+                    "train/step": global_step,
+                })
+            pbar.set_postfix({
+                'c_loss': f'{critic_loss.item():.4f}',
+                'p_loss': f'{policy_loss.item():.4f}',
+                'adv': f'{advantages.mean().item():.4f}',
+            })
         
         # Save checkpoint
-        if epoch % save_freq == 0:
-            torch.save(model.state_dict(), os.path.join(save_dir, f"model_epoch_{epoch}.pth"))
+        if global_step % save_freq == 0:
+            torch.save(model.state_dict(), os.path.join(save_dir, f"model_step_{global_step}.pth"))
+            torch.save(critic.state_dict(), os.path.join(save_dir, f"critic_step_{global_step}.pth"))
     
-    # Save final model
+    pbar.close()
+    
+    # Save final models
     torch.save(model.state_dict(), os.path.join(save_dir, "model_final.pth"))
+    torch.save(critic.state_dict(), os.path.join(save_dir, "critic_final.pth"))
     
-    return model
+    return model, critic
 
 
 # ============================================================================
@@ -506,6 +593,12 @@ if __name__ == "__main__":
     parser.add_argument("--exp_name", type=str, default="aawr")
     parser.add_argument("--env_name", type=str, default="darkroom-easy")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--continuous_action", action="store_true", help="Use continuous actions (for Ant)")
+    
+    # Ant-specific
+    parser.add_argument("--num_goals", type=int, default=50, help="Number of goals for Ant")
+    parser.add_argument("--radius", type=float, default=2.0, help="Goal sampling radius for Ant")
+    parser.add_argument("--env_horizon", type=int, default=20, help="Environment horizon for Ant")
     
     # Data collection
     parser.add_argument("--dataset_size", type=int, default=10000)
@@ -522,9 +615,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     
+    # Training
+    parser.add_argument("--total_gradient_steps", type=int, default=100000, help="Total gradient steps for joint training")
+    
     # Critic (IQL)
     parser.add_argument("--critic_lr", type=float, default=3e-4)
-    parser.add_argument("--critic_epochs", type=int, default=100)
     parser.add_argument("--critic_hidden_dim", type=int, default=256)
     parser.add_argument("--expectile", type=float, default=0.9, help="IQL expectile")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
@@ -532,7 +627,6 @@ if __name__ == "__main__":
     
     # Policy (AWR)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--policy_epochs", type=int, default=100)
     parser.add_argument("--awr_temperature", type=float, default=3.0, help="AWR temperature")
     parser.add_argument("--awr_filter", type=str, default="exp_clamp", 
                         choices=["none", "indicator", "exp_clamp"])
@@ -580,16 +674,35 @@ if __name__ == "__main__":
 
     # Create environments
     print(f"Creating environments: {args.env_name}")
-    train_envs, test_envs, eval_envs = create_env(args.env_name, args.dataset_size, args.n_envs)
     
-    state_dim = train_envs[0]._envs[0].state_dim
-    action_dim = train_envs[0]._envs[0].action_dim
-    env_horizon = train_envs[0]._envs[0].horizon
-    goal_dim = len(train_envs[0]._envs[0].goal)
+    if args.env_name == "ant":
+        from envs.ant_env import create_ant_envs
+        train_envs, test_envs, eval_envs = create_ant_envs(
+            num_goals=args.num_goals,
+            dataset_size=args.dataset_size,
+            n_envs=args.n_envs,
+            horizon=args.env_horizon,
+            radius=args.radius,
+            seed=args.seed,
+        )
+        # Ant env uses different attribute names
+        state_dim = train_envs[0].state_dim  # 29
+        action_dim = train_envs[0].action_dim  # 8
+        goal_dim = 2
+        env_horizon = train_envs[0].horizon
+        # Force continuous action for Ant
+        args.continuous_action = True
+    else:
+        train_envs, test_envs, eval_envs = create_env(args.env_name, args.dataset_size, args.n_envs)
+        state_dim = train_envs[0]._envs[0].state_dim
+        action_dim = train_envs[0]._envs[0].action_dim
+        env_horizon = train_envs[0]._envs[0].horizon
+        goal_dim = len(train_envs[0]._envs[0].goal)
     
     print(f"State dim: {state_dim}, Action dim: {action_dim}, Env horizon: {env_horizon}")
     print(f"Goal dim: {goal_dim}")
     print(f"Model horizon: {args.horizon}")
+    print(f"Continuous action: {args.continuous_action}")
 
     # ========================================================================
     # Phase 1: Collect offline data with noisy expert
@@ -678,9 +791,8 @@ if __name__ == "__main__":
     print("="*60)
     
     # Model configuration
-    continuous_action = isinstance(train_envs[0]._envs[0].action_space, gym.spaces.Box)
     model_args = {
-        "horizon": 4000,
+        "horizon": args.horizon,
         "state_dim": state_dim,
         "action_dim": action_dim,
         "n_layer": args.num_layers,
@@ -689,9 +801,17 @@ if __name__ == "__main__":
         "dropout": args.dropout,
         "shuffle": True,
         "test": False,
-        "continuous_action": continuous_action,
+        "continuous_action": args.continuous_action,
         "gmm_heads": 1,
     }
+    
+    # Add continuous action parameters
+    if args.continuous_action:
+        model_args.update({
+            "std_min": 0.007,
+            "std_max": 2.0,
+            "init_std": 0.3,
+        })
     
     with open(os.path.join(save_dir, "model_args.pkl"), "wb") as f:
         pickle.dump(model_args, f)
@@ -707,6 +827,7 @@ if __name__ == "__main__":
         save_dir=os.path.join(save_dir, "policy"),
         action_dim=action_dim,
         env_horizon=env_horizon,
+        continuous_action=args.continuous_action,
     )
 
     # ========================================================================
@@ -719,10 +840,12 @@ if __name__ == "__main__":
     eval_policy = get_rollout_policy(
         "decision_transformer",
         model=model,
-        context_horizon=4000,
+        context_horizon=args.horizon,
         env_horizon=env_horizon,
         context_accumulation=False,
-        sliding_window=True,
+        sliding_window=False,
+        continuous_action=args.continuous_action,
+        low_noise_eval=args.continuous_action,  # Low noise for continuous actions
     )
     
     eval_save_dir = os.path.join(save_dir, "eval")

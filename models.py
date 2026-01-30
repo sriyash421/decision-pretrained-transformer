@@ -11,7 +11,7 @@ from torch.distributions import TransformedDistribution, TanhTransform, Normal, 
 MEAN_CLAMP = 9.0     # mean_limits=(-9.0, 9.0)
 
 def get_model(model_type, horizon, state_dim, action_dim, continuous_action, gmm_heads=1):
-    n_embd = 128
+    n_embd = 256
     n_head = 4
     n_layer = 4
     dropout = 0.1

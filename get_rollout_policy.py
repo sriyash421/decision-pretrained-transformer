@@ -144,7 +144,7 @@ class TransformerPolicy(BasePolicy):
     """
 
     def __init__(self, model, temp=0.1, context_horizon=None, env_horizon=None, 
-                 sliding_window=True, use_value_guide=False, action_stats=None):
+                 sliding_window=False, use_value_guide=False, action_stats=None):
         """
         Args:
             model: Trained Decision Transformer model
@@ -265,7 +265,7 @@ class HybridPolicy(TransformerPolicy):
     """
 
     def __init__(self, model, temp=0.1, context_horizon=None, env_horizon=None, 
-                 sliding_window=True, beta=0.5, action_stats=None):
+                 sliding_window=False, beta=0.5, action_stats=None):
         super().__init__(model, temp, context_horizon, env_horizon, sliding_window, action_stats=action_stats)
         self.expert = ExpertPolicy()
         self.beta = beta
@@ -289,7 +289,7 @@ class ContextAccumulationPolicy(TransformerPolicy):
     """
 
     def __init__(self, model, temp=0.1, context_horizon=None, env_horizon=None, 
-                 sliding_window=True, beta=0.0, action_stats=None):
+                 sliding_window=False, beta=0.0, action_stats=None):
         super().__init__(model, temp, context_horizon, env_horizon, sliding_window, action_stats=action_stats)
         self.expert = ExpertPolicy()
         self.num_episodes = context_horizon // env_horizon if env_horizon else 1

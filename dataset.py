@@ -225,18 +225,23 @@ class SequenceDataset(torch.utils.data.Dataset):
         # Only normalize expert_actions (supervision targets), not input actions
         # Input actions are raw actions taken in the environment
         actions = traj['actions']
-        expert_actions = traj['expert_actions']
-        if self.normalize_actions:
-            expert_actions = self._normalize_action(expert_actions)
+        # if 'expert_actions' in traj:
+        #     expert_actions = traj['expert_actions']
+        # else:
+        #     expert_actions = None
+        # if self.normalize_actions:
+        #     expert_actions = self._normalize_action(expert_actions)
         
         res = {
             'states': convert_to_tensor(traj['states'], store_gpu=self.store_gpu),
             'actions': convert_to_tensor(actions, store_gpu=self.store_gpu),
-            'expert_actions': convert_to_tensor(expert_actions, store_gpu=self.store_gpu),
+            # 'expert_actions': convert_to_tensor(expert_actions, store_gpu=self.store_gpu),
             'rewards': convert_to_tensor(traj['rewards'], store_gpu=self.store_gpu),
             'dones': convert_to_tensor(traj['dones'], store_gpu=self.store_gpu),
         }
-        
+
+        if 'expert_actions' in traj:
+            res['expert_actions'] = convert_to_tensor(traj['expert_actions'], store_gpu=self.store_gpu)
         # Include optional fields if present
         if 'values' in traj:
             res['values'] = convert_to_tensor(traj['values'], store_gpu=self.store_gpu)
@@ -246,6 +251,12 @@ class SequenceDataset(torch.utils.data.Dataset):
             res['query_actions'] = convert_to_tensor(traj['query_actions'], store_gpu=self.store_gpu)
         if 'query_values' in traj:
             res['query_values'] = convert_to_tensor(traj['query_values'], store_gpu=self.store_gpu)
+        
+        if 'goals' in traj:
+            res['goals'] = convert_to_tensor(traj['goals'], store_gpu=self.store_gpu)
+        
+        if 'next_states' in traj:
+            res['next_states'] = convert_to_tensor(traj['next_states'], store_gpu=self.store_gpu)
 
         return res
 

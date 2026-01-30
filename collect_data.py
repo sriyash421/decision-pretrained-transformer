@@ -99,6 +99,96 @@ def dagger_rollout(env, rollout_policy, horizon):
     
     return data
 
+def dagger_rollout_aawr(env, horizon):
+    state = env.reset()
+    n_envs = env.num_envs
+    
+    states = []
+    next_states = []
+    actions = []
+    goals = []
+    rewards = []
+    dones_list = []
+
+    action_env_idxs = np.random.randint(0, env.num_envs, size=env.num_envs)
+    for t in range(horizon):
+        # action = [env.envs[i].opt_action(state[i], env.have_keys[idx]) for idx, i in enumerate(action_env_idxs)] # (n_envs, action_dim)
+        # Get expert action for supervision (raw from environment)
+        if hasattr(env, "have_keys"):
+            action = [env.envs[i].opt_action(state[i], env.have_keys[idx]) for idx, i in enumerate(action_env_idxs)] # (n_envs, action_dim)
+            goal = np.concatenate((env._keys, env._doors), axis=1)
+        else:
+            action = [env.envs[i].opt_action(state[i]) for i in action_env_idxs] # (n_envs, action_dim)
+            goal = env._goals
+
+        # Step environment with denormalized action
+        next_state, reward, done, _ = env.step(action)
+        
+        # Store RAW actions (normalization is done by SequenceDataset)
+        states.append(state)
+        actions.append(action)  # Store denormalized (raw) action
+        goals.append(goal)  # Store raw expert action
+        rewards.append(reward)
+        dones_list.append(done)
+
+        next_states.append(next_state)
+        # Handle episode resets
+        if np.any(done):
+            next_state = env.reset()
+            action_env_idxs = np.random.randint(0, env.num_envs, size=env.num_envs)
+        
+        state = next_state
+
+    # Stack arrays
+    data = {
+        "states": np.stack(states, axis=1),
+        "actions": np.stack(actions, axis=1),
+        "goals": np.stack(goals, axis=1),
+        "rewards": np.stack(rewards, axis=1),
+        "dones": np.stack(dones_list, axis=1),
+        "next_states": np.stack(next_states, axis=1),
+    }
+    
+    # Verify shapes
+    assert data["states"].shape == (n_envs, horizon, env.state_dim)
+    assert data["actions"].shape == (n_envs, horizon, env.action_dim)
+    assert data["goals"].shape[:2] == (n_envs, horizon)
+    assert data["rewards"].shape == (n_envs, horizon)
+    assert data["dones"].shape == (n_envs, horizon)
+    assert data["next_states"].shape == (n_envs, horizon, env.state_dim)
+    
+    return data
+
+def get_dagger_data_aawr(envs, rollout_policy, horizon):
+    """
+    Collect DAgger data from multiple environments.
+    
+    Args:
+        envs: List of vectorized environments
+        rollout_policy: Policy for data collection
+        horizon: Steps per environment
+    
+    Returns:
+        List of trajectory dictionaries
+    """
+    trajs = []
+    for env in tqdm.tqdm(envs, desc="Collecting dagger data"):
+        data = dagger_rollout_aawr(env, horizon)
+        n_envs = env.num_envs
+        
+        for k in range(n_envs):
+            
+            traj = {
+                "states": data["states"][k],
+                "actions": data["actions"][k],
+                # "expert_actions": data["expert_actions"][k],
+                "rewards": data["rewards"][k],
+                "dones": data["dones"][k],
+                "goals": data["goals"][k],
+                "next_states": data["next_states"][k],
+            }
+            trajs.append(traj)
+    return trajs
 
 def get_dagger_data(envs, rollout_policy, horizon):
     """
@@ -218,6 +308,54 @@ def get_dagger_dataset(train_envs, test_envs, rollout_policy, horizon,
         {**config, "shuffle": False},
         action_stats=train_dataset.get_action_stats(),  # Use train stats!
         normalize_actions=normalize_actions,
+    )
+    
+    return train_dataset, test_dataset
+
+
+def get_dagger_dataset_aawr(train_envs, test_envs, rollout_policy, horizon, 
+                       normalize_actions=False, action_stats=None):
+    """
+    Create train and test datasets using DAgger-style collection.
+    
+    Args:
+        train_envs: List of training environments
+        test_envs: List of test environments  
+        rollout_policy: Policy for data collection
+        horizon: Steps per environment
+        normalize_actions: Whether to normalize actions
+        action_stats: Optional dict with 'mean' and 'std'. If None and 
+                     normalize_actions=True, compute from training data.
+    
+    Returns:
+        train_dataset, test_dataset: SequenceDataset instances
+    """
+    from dataset import SequenceDataset
+
+    train_trajs = get_dagger_data_aawr(train_envs, rollout_policy, horizon)
+    test_trajs = get_dagger_data_aawr(test_envs, rollout_policy, horizon)
+    
+    config = {
+        "horizon": horizon, 
+        "store_gpu": False, 
+        "state_dim": train_envs[0].state_dim, 
+        "action_dim": train_envs[0].action_dim
+    }
+    
+    # Create train dataset (computes action stats if needed)
+    train_dataset = SequenceDataset(
+        train_trajs, 
+        {**config, "shuffle": True},
+        # action_stats=action_stats,
+        # normalize_actions=normalize_actions,
+    )
+    
+    # Use same action stats for test dataset
+    test_dataset = SequenceDataset(
+        test_trajs, 
+        {**config, "shuffle": False},
+        # action_stats=train_dataset.get_action_stats(),  # Use train stats!
+        # normalize_actions=normalize_actions,
     )
     
     return train_dataset, test_dataset
