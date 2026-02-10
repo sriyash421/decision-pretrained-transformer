@@ -2,6 +2,7 @@ import numpy as np
 import struct
 from gymnasium import spaces
 from procgen import ProcgenGym3Env
+from PIL import Image
 
 
 # procgen discrete(15) -> our discrete(4): 0=up, 1=down, 2=left, 3=right
@@ -293,13 +294,40 @@ def _draw_circle(img, cx, cy, r, color):
 
 
 class VecProcgenMaze:
-    """Vectorized gymnasium-style wrapper. Each sub-env shares one ProcgenGym3Env."""
+    """Vectorized gymnasium-style wrapper. Each sub-env shares one ProcgenGym3Env.
 
-    def __init__(self, env, render_mode=None):
+    Parameters
+    ----------
+    env : ProcgenGym3Env
+        The underlying gym3 vectorized environment.
+    render_mode : str or None
+        If "rgb_array", full 512×512 renders are stored in infos.
+    visibility : int or None
+        Partial-observability window size (e.g. 7).  Observations are always
+        ``(world_dim, world_dim, 3)`` float32 grids:
+
+        * channel 0 – wall:  1 = wall, 0 = free, −1 = outside visibility
+        * channel 1 – goal:  1 = goal, 0 = not goal, −1 = outside visibility
+        * channel 2 – agent: 1 = agent, 0 = empty, −1 = outside visibility
+
+        When *visibility* is ``None`` every cell is visible (full obs).
+        Otherwise only a *visibility × visibility* window centred on the
+        agent is revealed; all other cells are −1 in every channel.
+    """
+
+    def __init__(self, env, render_mode=None, visibility=None):
+        self.env_fn = env
+        env = self.env_fn()
         self.env = env
         self.n = env.num
         self.render_mode = render_mode
-        self.observation_space = spaces.Box(0, 255, (64, 64, 3), np.uint8)
+        self.visibility = visibility
+
+        # world_dim is determined after the first reset; placeholder 15 (easy)
+        self._world_dim = 15
+        self.observation_space = spaces.Box(
+            -1, 1, (self._world_dim, self._world_dim, 3), np.float32,
+        )
         self.action_space = spaces.Discrete(N_ACT)
         self._opt = [None] * self.n
         self._apos = [None] * self.n
@@ -331,11 +359,65 @@ class VecProcgenMaze:
         else:
             self._opt[i] = None
 
+    # ------------------------------------------------------------------
+    #  Grid observation builder
+    # ------------------------------------------------------------------
+    def _build_grid_obs(self):
+        """Build (world_dim, world_dim, 3) observations for all sub-envs.
+
+        Channel 0 – wall:   1 = wall,  0 = free space, −1 = outside visibility
+        Channel 1 – goal:   1 = goal,  0 = not goal,   −1 = outside visibility
+        Channel 2 – agent:  1 = agent, 0 = empty,      −1 = outside visibility
+
+        When self.visibility is None every cell is visible.
+        Otherwise only a visibility × visibility window centred on the agent
+        is revealed; all other cells are set to −1 in every channel.
+
+        Returns np.ndarray of shape (n, wd, wd, 3) float32.
+        """
+        wd = self._world_dim
+        obs = np.full((self.n, wd, wd, 3), -1.0, dtype=np.float32)
+
+        for i in range(self.n):
+            ax, ay = self._apos[i]
+            nav = self._nav[i]
+            gpos = self._gpos[i]
+            gx, gy = gpos if gpos is not None else (-1, -1)
+
+            # determine which cells are visible
+            if self.visibility is not None:
+                half = self.visibility // 2
+                x_lo = max(0, ax - half)
+                x_hi = min(wd, ax + half + 1)
+                y_lo = max(0, ay - half)
+                y_hi = min(wd, ay + half + 1)
+            else:
+                x_lo, x_hi = 0, wd
+                y_lo, y_hi = 0, wd
+
+            for y in range(y_lo, y_hi):
+                for x in range(x_lo, x_hi):
+                    # ch0: wall (1) / free (0)
+                    obs[i, y, x, 0] = 0.0 if nav[y, x] else 1.0
+                    # ch1: goal
+                    obs[i, y, x, 1] = 1.0 if (x == gx and y == gy) else 0.0
+                    # ch2: agent
+                    obs[i, y, x, 2] = 1.0 if (x == ax and y == ay) else 0.0
+
+        return obs
+
     def reset(self):
+        self.env = self.env_fn()
         _, ob, _ = self.env.observe()
         self._solve_all()
-        obs = ob["rgb"]
-        infos = self._build_infos()
+        # update world_dim / observation_space from first env
+        if self._wd[0] is not None and self._wd[0] != self._world_dim:
+            self._world_dim = self._wd[0]
+            self.observation_space = spaces.Box(
+                -1, 1, (self._world_dim, self._world_dim, 3), np.float32)
+        raw_rgb = ob["rgb"]
+        obs = self._build_grid_obs()
+        infos = self._build_infos(raw_rgb=raw_rgb)
         return obs, infos
 
     def step(self, actions):
@@ -345,7 +427,7 @@ class VecProcgenMaze:
         self.env.act(pa)
         rew, ob, first = self.env.observe()
 
-        obs = ob["rgb"]
+        raw_rgb = ob["rgb"]
         rews = rew.astype(np.float32)
         dones = first.astype(bool)
 
@@ -356,7 +438,8 @@ class VecProcgenMaze:
             else:
                 self._refresh_apos(i)
 
-        infos = self._build_infos()
+        obs = self._build_grid_obs()
+        infos = self._build_infos(raw_rgb=raw_rgb)
         return obs, rews, dones, infos
 
     def _refresh_apos(self, i):
@@ -364,11 +447,14 @@ class VecProcgenMaze:
         nav, apos, _, _ = _extract_grid(self.env, i)
         self._apos[i] = apos
 
-    def _build_infos(self):
+    def _build_infos(self, raw_rgb=None):
         raw = self.env.get_info()
         infos = []
         for i in range(self.n):
             d = {}
+            # always include the full 64x64 RGB for video rendering
+            if raw_rgb is not None:
+                d["full_obs"] = raw_rgb[i]
             if self.render_mode == "rgb_array" and "rgb" in raw[i]:
                 d["rgb"] = raw[i]["rgb"]
                 self._last_rgb[i] = raw[i]["rgb"]
@@ -399,9 +485,18 @@ def make_maze_envs(
     train_levels=100,
     eval_start=100,
     eval_levels=20,
+    visibility=None,
 ):
-    """Create train and eval ProcgenMaze envs wrapped in gymnasium style."""
-    train_g3 = ProcgenGym3Env(
+    """Create train and eval ProcgenMaze envs wrapped in gymnasium style.
+
+    Parameters
+    ----------
+    visibility : int or None
+        If set, observations are ``(world_dim, world_dim, 3)`` grids with
+        partial visibility masking (-1 for unseen cells).
+        See :class:`VecProcgenMaze`.
+    """
+    train_g3 = lambda : ProcgenGym3Env(
         num=n_train,
         env_name="maze",
         start_level=train_start,
@@ -412,7 +507,7 @@ def make_maze_envs(
         use_backgrounds=False,
         use_monochrome_assets=True,
     )
-    eval_g3 = ProcgenGym3Env(
+    eval_g3 = lambda : ProcgenGym3Env(
         num=n_eval,
         env_name="maze",
         start_level=eval_start,
@@ -424,16 +519,69 @@ def make_maze_envs(
         render_mode="rgb_array",
         use_monochrome_assets=True,
     )
-    train_env = VecProcgenMaze(train_g3)
-    eval_env = VecProcgenMaze(eval_g3, render_mode="rgb_array")
+    train_env = VecProcgenMaze(train_g3, visibility=visibility)
+    eval_env = VecProcgenMaze(eval_g3, render_mode="rgb_array",
+                              visibility=visibility)
     return train_env, eval_env
+
+
+def _render_grid_obs(obs_3ch, cell_px=40):
+    """Render a (world_dim, world_dim, 3) grid observation as an RGB image.
+
+    Channel semantics (values -1 / 0 / 1):
+      ch0 – walls:  1=wall, 0=free, -1=outside visibility
+      ch1 – goal:   1=goal, 0=not goal, -1=outside visibility
+      ch2 – agent:  1=agent, 0=empty, -1=outside visibility
+
+    Colour mapping:
+      * Gray (120) – outside visibility (any channel == -1)
+      * Black      – wall  (ch0==1)
+      * White      – free navigable cell
+      * Green      – goal  (ch1==1)
+      * Red        – agent (ch2==1)
+
+    Returns uint8 array of shape (wd*cell_px, wd*cell_px, 3).
+    """
+    wd = obs_3ch.shape[0]
+    size = wd * cell_px
+    img = np.zeros((size, size, 3), dtype=np.uint8)
+    for gy in range(wd):
+        for gx in range(wd):
+            py = gy * cell_px
+            px = gx * cell_px
+            ch0, ch1, ch2 = obs_3ch[gy, gx]
+            if ch0 < -0.5:
+                # outside visibility window → gray
+                img[py:py + cell_px, px:px + cell_px] = 120
+            elif ch0 > 0.5:
+                # wall → black (already 0)
+                pass
+            else:
+                # free cell → white
+                img[py:py + cell_px, px:px + cell_px] = 255
+            # overlay goal (green)
+            if ch1 > 0.5:
+                img[py:py + cell_px, px:px + cell_px] = (0, 200, 0)
+            # overlay agent (red, slightly inset)
+            if ch2 > 0.5:
+                m = cell_px // 5
+                img[py + m:py + cell_px - m,
+                    px + m:px + cell_px - m] = (220, 40, 40)
+    # draw grid lines
+    for k in range(wd + 1):
+        coord = k * cell_px
+        if coord < size:
+            img[coord, :] = 80
+            img[:, coord] = 80
+    return img
 
 
 def _rollout_multi(env, policy, n_episodes=5, max_t=500):
     """Run rollouts collecting episodes from all sub-envs.
 
     Returns dict mapping (env_idx, episode_number) to
-    list of (obs, rgb, opt_grid) frames.
+    list of (bin_obs_rgb, full_obs, rgb, opt_grid) frames.
+    *bin_obs_rgb* is the rendered binary obs (or None if not using visibility).
     """
     obs, infos = env.reset()
     ep_count = [0] * env.n
@@ -445,8 +593,14 @@ def _rollout_multi(env, policy, n_episodes=5, max_t=500):
         for i in range(env.n):
             rgb = infos[i].get("rgb", obs[i])
             og = infos[i].get("opt_grid", None)
+            full_obs = infos[i].get("full_obs", obs[i])
+            # render binary obs if visibility is on
+            if env.visibility is not None:
+                bin_panel = _render_grid_obs(obs[i])
+            else:
+                bin_panel = None
             cur_frames[i].append(
-                (obs[i].copy(), rgb.copy(),
+                (bin_panel, full_obs.copy(), rgb.copy(),
                  og.copy() if og is not None else None)
             )
         obs, rews, dones, infos = env.step(acts)
@@ -464,28 +618,51 @@ def _rollout_multi(env, policy, n_episodes=5, max_t=500):
     return all_episodes
 
 
-def _save_video(frames, path, fps=10):
-    """Save list of (obs, rgb, opt_grid) as side-by-side mp4."""
+def _save_video(frames, path, fps=10, labels=None, panel_size=256):
+    """Save list of (bin_obs_rgb, full_obs, rgb, opt_grid) as side-by-side mp4.
+
+    Panels (left to right): binary-obs | full-obs | procgen-render | opt-grid.
+    Panels that are None are skipped.  All panels are resized to
+    *panel_size × panel_size*.
+
+    Parameters
+    ----------
+    labels : list[str] or None
+        If provided, a text label is drawn on each frame (same length as
+        *frames*).  Useful for showing "EXPERT" / "POLICY" per timestep.
+    panel_size : int
+        Height and width (in pixels) of each panel in the video.
+    """
     import imageio_ffmpeg
-    from PIL import Image
+    from PIL import ImageDraw
+    ps = panel_size
     combined = []
-    for obs_f, rgb_f, og_f in frames:
-        rh, rw = rgb_f.shape[:2]
-        # resize obs to match rgb height
-        obs_r = np.array(
-            Image.fromarray(obs_f).resize(
-                (rw, rh), Image.NEAREST
-            )
-        )
-        panels = [obs_r, rgb_f]
+    for idx, (bin_f, full_f, rgb_f, og_f) in enumerate(frames):
+        panels = []
+        if bin_f is not None:
+            panels.append(np.array(
+                Image.fromarray(bin_f).resize((ps, ps), Image.NEAREST)))
+        if full_f is not None:
+            panels.append(np.array(
+                Image.fromarray(full_f).resize((ps, ps), Image.NEAREST)))
+        if rgb_f is not None:
+            panels.append(np.array(
+                Image.fromarray(rgb_f).resize((ps, ps), Image.NEAREST)))
         if og_f is not None:
-            og_r = np.array(
-                Image.fromarray(og_f).resize(
-                    (rw, rh), Image.NEAREST
-                )
-            )
-            panels.append(og_r)
-        combined.append(np.concatenate(panels, axis=1))
+            panels.append(np.array(
+                Image.fromarray(og_f).resize((ps, ps), Image.NEAREST)))
+        row = np.concatenate(panels, axis=1)
+
+        # draw text label if provided
+        if labels is not None and idx < len(labels):
+            pil_img = Image.fromarray(row)
+            draw = ImageDraw.Draw(pil_img)
+            txt = labels[idx]
+            color = (0, 255, 0) if "EXPERT" in txt else (255, 100, 100)
+            draw.text((5, 5), txt, fill=color)
+            row = np.array(pil_img)
+
+        combined.append(row)
     h, w = combined[0].shape[:2]
     writer = imageio_ffmpeg.write_frames(
         path, (w, h), fps=fps, pix_fmt_in="rgb24"
@@ -499,7 +676,6 @@ def _save_video(frames, path, fps=10):
 
 if __name__ == "__main__":
     import os
-    from PIL import Image
 
     out_dir = "maze_debug_videos"
     os.makedirs(out_dir, exist_ok=True)
@@ -509,6 +685,7 @@ if __name__ == "__main__":
     _, eval_env = make_maze_envs(
         n_train=2, n_eval=n_envs,
         train_levels=10, eval_levels=20,
+        visibility=7,
     )
 
     obs, infos = eval_env.reset()
@@ -516,15 +693,22 @@ if __name__ == "__main__":
     print(f"info keys: {list(infos[0].keys())}")
     if "rgb" in infos[0]:
         print(f"info rgb shape: {infos[0]['rgb'].shape}")
+    if "full_obs" in infos[0]:
+        print(f"info full_obs shape: {infos[0]['full_obs'].shape}")
     print(f"opt_action: {infos[0].get('opt_action', 'N/A')}")
 
-    # save static opt_grid images for each env
+    # save static images for each env
     for i in range(n_envs):
         og = infos[i].get("opt_grid")
         if og is not None:
             p = os.path.join(out_dir, f"opt_grid_env{i}.png")
             Image.fromarray(og).save(p)
             print(f"saved {p}")
+        # render and save the binary obs
+        bin_img = _render_grid_obs(obs[i])
+        p = os.path.join(out_dir, f"grid_obs_env{i}.png")
+        Image.fromarray(bin_img).save(p)
+        print(f"saved {p}")
         # print agent/goal positions for debugging
         print(f"  env{i}: agent={eval_env._apos[i]}, "
               f"goal={eval_env._gpos[i]}, "

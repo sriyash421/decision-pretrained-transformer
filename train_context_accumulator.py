@@ -1,11 +1,11 @@
 """
-Context Accumulation Training Algorithm.
+Context Accumulation Training Algorithm for Procgen Maze.
 
-This script trains a Decision Transformer using iterative data collection (DAgger-style).
-At each iteration:
-1. Collect data using current policy with increasing horizon
-2. Train model on accumulated data
-3. Evaluate and log metrics
+This script trains a Decision Transformer (CNN) using iterative data collection
+(DAgger-style).  At each iteration:
+1. Collect data using a mixture of expert and learned policy
+2. Train model on collected data
+3. Evaluate and log metrics / videos
 """
 
 import torch.multiprocessing as mp
@@ -14,48 +14,367 @@ if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method("spawn", force=True)
 
 import argparse
-import copy
 import os
 import pickle
 import random
 from collections import defaultdict
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
 import wandb
 
-from create_envs import create_env
-from collect_data import get_dagger_dataset, merge_sequence_datasets
-from dataset import collate_fn
-from eval_policy import evaluate_policy_on_envs, compute_episode_returns, plot_returns
-from get_rollout_policy import get_rollout_policy
-from models import DecisionTransformer
+from PIL import Image
+
+from get_rollout_policy import TransformerCNNPolicy
+from models import DecisionTransformerCnn
+from procgen_env import make_maze_envs, _render_grid_obs
 
 
-def get_loss_mask(attention_mask, horizon):
+# ---------------------------------------------------------------------------
+#  Evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
+                                    save_dir, dagger_step, plot=True,
+                                    panel_size=256):
     """
-    Get a mask for the loss only on the last `horizon` tokens.
-    
-    Args:
-        attention_mask: (batch_size, seq_len) tensor
-        horizon: Number of tokens from the end to include in loss
-    
-    Returns:
-        loss_mask: (batch_size, seq_len) tensor with 1s for tokens to include
+    Evaluate *policy* on the VecProcgenMaze *eval_envs*.
+
+    * Runs one batch of parallel episodes up to *eval_horizon* steps.
+    * Records per-env videos with two side-by-side panels:
+      partial obs (rendered grid) | full RGB frame.
+    * Returns (mean_return, std_return) across environments.
     """
-    loss_mask = torch.zeros_like(attention_mask)
-    for i in range(loss_mask.size(0)):
-        non_zero_indices = torch.nonzero(attention_mask[i], as_tuple=False).squeeze()
-        if len(non_zero_indices.shape) == 0:
-            non_zero_indices = non_zero_indices.unsqueeze(0)
-        if len(non_zero_indices) >= horizon:
-            loss_mask[i, non_zero_indices[-horizon:]] = 1
-        else:
-            loss_mask[i, non_zero_indices] = 1
-    return loss_mask
+    import imageio_ffmpeg
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    obs, infos = eval_envs.reset()
+    resets = np.ones(eval_envs.n, dtype=bool)
+    policy.reset(resets)
+
+    n = eval_envs.n
+    done_flag = np.zeros(n, dtype=bool)
+    episode_rewards = np.zeros(n, dtype=np.float32)
+    # each frame is (partial_rgb, full_rgb) – both uint8
+    episode_frames = [[] for _ in range(n)]
+
+    ps = panel_size
+
+    for t in range(eval_horizon):
+        for i in range(n):
+            if not done_flag[i]:
+                # rendered partial obs
+                partial = _render_grid_obs(obs[i])  # uint8
+                partial = np.array(Image.fromarray(partial).resize(
+                    (ps, ps), Image.NEAREST))
+                # full RGB from procgen
+                rgb = infos[i].get("rgb", infos[i].get("full_obs"))
+                rgb = np.array(Image.fromarray(rgb).resize(
+                    (ps, ps), Image.NEAREST))
+                episode_frames[i].append((partial, rgb))
+
+        actions = policy.get_action(obs)
+        obs, rewards, dones, infos = eval_envs.step(actions)
+        policy.reset(dones)
+
+        for i in range(n):
+            if not done_flag[i]:
+                episode_rewards[i] += rewards[i]
+            if dones[i] and not done_flag[i]:
+                done_flag[i] = True
+
+        if done_flag.all():
+            break
+
+    # save mp4 videos for up to 5 envs
+    for i in range(min(5, n)):
+        if len(episode_frames[i]) == 0:
+            continue
+        vid_path = os.path.join(save_dir, f"episode_{i}.mp4")
+        # build side-by-side frames
+        vid_frames = []
+        for partial, rgb in episode_frames[i]:
+            vid_frames.append(np.concatenate([partial, rgb], axis=1))
+        h, w = vid_frames[0].shape[:2]
+        writer = imageio_ffmpeg.write_frames(
+            vid_path, (w, h), fps=10, pix_fmt_in="rgb24")
+        writer.send(None)
+        for frame in vid_frames:
+            writer.send(frame.tobytes())
+        writer.close()
+
+        if wandb.run is not None:
+            wandb.log({
+                f"Eval-Step{dagger_step}/episode_{i}_video":
+                    wandb.Video(vid_path, format="mp4")
+            })
+
+    mean_ret = float(np.mean(episode_rewards))
+    std_ret = float(np.std(episode_rewards))
+    return mean_ret, std_ret
+
+
+# ---------------------------------------------------------------------------
+#  Dataset
+# ---------------------------------------------------------------------------
+
+class TrajectoryDataset(torch.utils.data.Dataset):
+    """Dataset of variable-length trajectories collected from procgen maze."""
+
+    def __init__(self, trajectories):
+        self.trajectories = trajectories
+
+    def __len__(self):
+        return len(self.trajectories)
+
+    def __getitem__(self, idx):
+        traj = self.trajectories[idx]
+        return {
+            # observations: (T, H, W, C) float32
+            "observations": torch.tensor(
+                np.array(traj['observations']), dtype=torch.float32),
+            # actions: (T,) long  – discrete action ids 0..3
+            "actions": torch.tensor(
+                np.array(traj['actions']), dtype=torch.long),
+            # rewards: (T,)
+            "rewards": torch.tensor(
+                np.array(traj['rewards']), dtype=torch.float32),
+            # dones: (T,)
+            "dones": torch.tensor(
+                np.array(traj['dones']), dtype=torch.float32),
+            # expert_actions: (T,) long
+            # "expert_actions": torch.tensor(
+            #     np.array(traj['expert_actions']), dtype=torch.long),
+            # expert_mask: (T,) float – 1 where expert was used
+            "expert_mask": torch.tensor(
+                np.array(traj['expert_mask']), dtype=torch.float32),
+        }
+
+class CustomWeightedRandomSampler(torch.utils.data.WeightedRandomSampler):
+    """
+    WeightedRandomSampler except allows for more than 2^24 samples
+    copied from https://github.com/pytorch/pytorch/issues/2576
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def __iter__(self):
+        weights_np = self.weights.numpy()
+        weights_sum = torch.sum(self.weights).numpy()
+        rand_tensor = np.random.choice(
+            range(0, len(self.weights)),
+            size=self.num_samples,
+            p=weights_np / weights_sum,
+            replace=self.replacement)
+        rand_tensor = torch.from_numpy(rand_tensor)
+        return iter(rand_tensor.tolist())
+    
+class MultiTrajectoryDataset(torch.utils.data.Dataset):
+    def __init__(self, datasets, sampling_ratios):
+        super().__init__()
+        self.datasets = datasets        
+        self.dataset_lengths = [len(d) for d in datasets]
+        self.sampling_ratios = sampling_ratios
+        normalized_ratios = np.array(sampling_ratios) / np.sum(sampling_ratios)
+        weights = []
+        for length, ratio in zip(self.dataset_lengths, normalized_ratios):
+            weights.extend([ratio / length] * length)
+        self.weights = torch.tensor(weights, dtype=torch.float32)
+        # self.weighted_sampler = CustomWeightedRandomSampler(self.weights, num_samples=len(self.weights), replacement=True)
+        self.cumulative_lengths = np.cumsum([0] + self.dataset_lengths)
+    
+    def __len__(self):
+        return sum(self.dataset_lengths)
+
+    def __getitem__(self, global_idx):
+        dataset_idx = np.searchsorted(self.cumulative_lengths[1:], global_idx, side='right')
+        local_idx = global_idx - self.cumulative_lengths[dataset_idx]
+        return self.datasets[dataset_idx][local_idx]
+
+
+def collate_fn_procgen(batch):
+    """Pad variable-length trajectories and build attention / expert masks."""
+    from torch.nn.utils.rnn import pad_sequence
+
+    padded = {}
+    for key in batch[0]:
+        padded[key] = pad_sequence(
+            [item[key] for item in batch], batch_first=True)
+
+    lengths = torch.tensor([item['actions'].shape[0] for item in batch])
+    max_len = int(lengths.max())
+    attn = torch.zeros(len(batch), max_len, dtype=torch.float32)
+    for i, l in enumerate(lengths):
+        attn[i, :l] = 1.0
+    padded['attention_mask'] = attn
+    return padded
+
+
+# def get_procgen_dataset(env, n_trajs, eval_policy=None, expert_p=1.0,
+#                         max_t=500, n_video_trajs=3):
+def get_procgen_dataset(env, n_trajs, eval_policy, exploration_steps_range,
+                        max_t=500, n_video_trajs=3):
+    """Collect trajectories. Returns (list_of_traj_dicts, dataset)."""
+    # if eval_policy is None:
+    #     assert expert_p == 1.0
+    # else:
+    resets = np.ones(env.n, dtype=bool)
+    eval_policy.reset(resets)
+
+    def _new():
+        return {'observations': [], 'actions': [], 'rewards': [],
+                'dones': [], 'expert_mask': [],
+                '_full_obs': [], '_rgb': [], '_opt_grid': []}
+
+    all_trajs = []
+    trajs = [_new() for _ in range(env.n)]
+    obs, infos = env.reset()
+    # is_expert = np.zeros(env.n, dtype=bool)
+    # max_exploration_steps = 
+    min_exploration_steps = exploration_steps_range[0]
+    max_exploration_steps = exploration_steps_range[1]
+
+    exploration_steps = np.random.randint(min_exploration_steps, max_exploration_steps + 1, size=env.n)
+    current_exploration_steps = np.zeros(env.n, dtype=int)
+    
+
+    while len(all_trajs) < n_trajs:
+        # pick actions
+        acts = np.zeros(env.n, dtype=np.int32)
+        # expert_acts = np.zeros(env.n, dtype=np.int32)
+        # is_expert = is_expert | (np.random.random(env.n) < expert_p)
+        current_exploration_steps += 1
+        use_expert = current_exploration_steps >= exploration_steps
+        if ~ use_expert.all():
+            policy_action = eval_policy.get_action(obs)
+        for i in range(env.n):
+            if use_expert[i]:
+                acts[i] = infos[i].get('opt_action', 0)
+            else:
+                acts[i] = policy_action[i]
+
+        next_obs, rews, dones, next_infos = env.step(acts)
+
+        for i in range(env.n):
+            save_vid = len(all_trajs) + i < n_video_trajs
+            trajs[i]['observations'].append(obs[i].copy())
+            trajs[i]['actions'].append(int(acts[i]))
+            trajs[i]['rewards'].append(float(rews[i]))
+            trajs[i]['dones'].append(bool(dones[i]))
+            # trajs[i]['expert_actions'].append(int(expert_acts[i]))
+            trajs[i]['expert_mask'].append(bool(use_expert[i]))
+            trajs[i]['_full_obs'].append(
+                infos[i].get('full_obs') if save_vid else None)
+            trajs[i]['_rgb'].append(
+                infos[i].get('rgb') if save_vid else None)
+            trajs[i]['_opt_grid'].append(
+                infos[i].get('opt_grid') if save_vid else None)
+
+            if dones[i]:
+                traj_return = sum(trajs[i]['rewards'])
+                save_flag = traj_return > 0 and current_exploration_steps[i] >= min_exploration_steps and len(trajs[i]['actions']) > 2
+                if save_flag:  # only keep successful trajectories
+                    all_trajs.append(trajs[i])
+                trajs[i] = _new()
+                # is_expert[i] = False
+                current_exploration_steps[i] = 0
+                exploration_steps[i] = np.random.randint(min_exploration_steps, max_exploration_steps + 1)
+
+        obs = next_obs
+        infos = next_infos
+        
+        if eval_policy is not None:
+            eval_policy.reset(dones)
+
+        if all(len(t['observations']) > max_t for t in trajs):
+            break
+
+    # # flush partial
+    # for i in range(env.n):
+    #     if len(trajs[i]['actions']) > 0:
+    #         all_trajs.append(trajs[i])
+
+    all_trajs = all_trajs[:n_trajs]
+    dataset = TrajectoryDataset(all_trajs)
+    return all_trajs, dataset
+
+
+ACT_NAMES = ["UP", "DOWN", "LEFT", "RIGHT"]
+
+
+def save_dataset_videos(trajs, save_dir, dagger_step, visibility=None,
+                        n_videos=100, panel_size=256):
+    """Save annotated videos showing only the observation for each timestep.
+
+    Each frame is the rendered binary obs (or raw RGB if no visibility),
+    labelled with action, expert/policy source, and cumulative return.
+    """
+    import imageio_ffmpeg
+    from PIL import ImageDraw
+
+    os.makedirs(save_dir, exist_ok=True)
+    count = 0
+    for traj in trajs:
+        if count >= n_videos:
+            break
+
+        T = len(traj['observations'])
+        if T == 0:
+            continue
+
+        combined = []
+        cum_ret = 0.0
+        for t in range(T):
+            obs_t = traj['observations'][t]
+
+            # render obs as RGB image
+            if visibility is not None:
+                img = _render_grid_obs(obs_t)  # (wd*40, wd*40, 3) uint8
+            else:
+                img = obs_t.astype(np.uint8) if obs_t.dtype != np.uint8 \
+                    else obs_t
+
+            # resize to panel_size
+            img = np.array(Image.fromarray(img).resize(
+                (panel_size, panel_size), Image.NEAREST))
+
+            # build label
+            cum_ret += traj['rewards'][t]
+            is_expert = traj['expert_mask'][t]
+            act_id = traj['actions'][t]
+            act_name = ACT_NAMES[act_id] if act_id < len(ACT_NAMES) \
+                else str(act_id)
+            src = "EXPERT" if is_expert else "POLICY"
+            txt = f"t={t} {src} a={act_name} R={cum_ret:.1f}"
+
+            # draw label
+            pil_img = Image.fromarray(img)
+            draw = ImageDraw.Draw(pil_img)
+            color = (0, 255, 0) if is_expert else (255, 100, 100)
+            draw.text((4, 4), txt, fill=color)
+            combined.append(np.array(pil_img))
+
+        # write mp4
+        h, w = combined[0].shape[:2]
+        vid_path = os.path.join(save_dir, f"dataset_traj_{count}.mp4")
+        writer = imageio_ffmpeg.write_frames(
+            vid_path, (w, h), fps=6, pix_fmt_in="rgb24")
+        writer.send(None)
+        for frame in combined:
+            writer.send(frame.tobytes())
+        writer.close()
+        print(f"saved {vid_path} ({T} frames)")
+
+        if wandb.run is not None:
+            wandb.log({
+                f"Dataset-Step{dagger_step}/traj_{count}":
+                    wandb.Video(vid_path, format="mp4")
+            })
+        count += 1
+    print(f"Saved {count} dataset trajectory videos to {save_dir}")
 
 
 def get_optimizer_scheduler(model, total_steps, lr, warmup_ratio):
@@ -82,7 +401,6 @@ def train_step(
     optimizer,
     scheduler,
     train_loader,
-    test_loader,
     save_dir,
     args,
     device,
@@ -113,63 +431,66 @@ def train_step(
     
     eval_freq = max(1, int(args.eval_interval * args.num_epochs))
     save_freq = max(1, int(args.save_interval * args.num_epochs))
-
-    best_test_loss = float('inf')
-    best_model = None
     
     def forward(batch):
-        """Compute loss for a batch (supports both discrete and continuous actions)."""
+        """Compute cross-entropy loss for discrete actions."""
         batch = {k: v.to(device) for k, v in batch.items()}
-        true_actions = batch["expert_actions"]
-        pred_output, _ = model(batch)
-        
-        # Apply loss mask to only compute loss on last env_horizon tokens
-        loss_mask = get_loss_mask(batch['attention_mask'], env_horizon)
-        
-        if args.continuous_action:
-            # Negative log likelihood loss for continuous actions (Gaussian distribution)
-            # pred_output is a distribution with Independent wrapper, 
-            # so log_prob already sums over action dimensions -> (B, T)
-            log_prob = pred_output.log_prob(true_actions)  # (B, T) since Independent sums over action dim
-            action_loss = -log_prob  # NLL
+
+        # Model expects dict with 'states', 'actions', 'rewards', 'dones'
+        # states: (B, T, H, W, C), actions: one-hot (B, T, A)
+        B, T = batch['observations'].shape[:2]
+        one_hot_actions = F.one_hot(
+            batch['actions'], action_dim).float()  # (B, T, A)
+        model_input = {
+            'states': batch['observations'],   # (B, T, H, W, C)
+            'actions': one_hot_actions,         # (B, T, A)
+            'rewards': batch['rewards'],        # (B, T)
+            'dones': batch['dones'],            # (B, T)
+        }
+
+        pred_logits = model(model_input)  # (B, T, A)
+
+        # true_actions = batch['expert_actions']  # (B, T) long
+        true_actions = batch['actions']  # (B, T) long
+
+        # Mask: only count loss where attention_mask AND expert_mask are 1
+        loss_mask = batch['attention_mask'] * batch['expert_mask']  # (B, T)
+
+        # Per-token cross entropy
+        action_loss = F.cross_entropy(
+            pred_logits.reshape(-1, action_dim),
+            true_actions.reshape(-1),
+            reduction='none',
+        )  # (B*T,)
+        action_loss = action_loss.reshape(B, T)
+
+        if loss_mask.sum() > 0:
             loss = (action_loss * loss_mask).sum() / loss_mask.sum()
         else:
-            # Cross entropy loss for discrete actions
-            action_loss = F.cross_entropy(
-                pred_output.reshape(-1, action_dim),
-                true_actions.reshape(-1, action_dim),
-                reduction='none'
-            )
-            loss = (action_loss.reshape(batch['attention_mask'].shape) * loss_mask).sum() / loss_mask.sum()
-        
+            loss = action_loss.mean()
+
         return loss, {"loss": loss.item()}
     
     for epoch in tqdm.tqdm(range(args.num_epochs), desc=f"Training DAgger Step {step_id}"):
         # Evaluation
-        if epoch % eval_freq == 0 or epoch == args.num_epochs - 1:
-            model.eval()
-            eval_stats = defaultdict(list)
+        # if epoch % eval_freq == 0 or epoch == args.num_epochs - 1:
+        #     model.eval()
+        #     eval_stats = defaultdict(list)
             
-            with torch.no_grad():
-                for batch in test_loader:
-                    loss, stats = forward(batch)
-                    for k, v in stats.items():
-                        eval_stats[k].append(v)
+        #     with torch.no_grad():
+        #         for batch in test_loader:
+        #             loss, stats = forward(batch)
+        #             for k, v in stats.items():
+        #                 eval_stats[k].append(v)
             
-            for k, v in eval_stats.items():
-                eval_stats[k] = np.mean(v)
+        #     for k, v in eval_stats.items():
+        #         eval_stats[k] = np.mean(v)
             
-            if args.log_wandb:
-                for k, v in eval_stats.items():
-                    wandb.log({f"dagger-{step_id}/test_{k}": v})
+        #     if args.log_wandb:
+        #         for k, v in eval_stats.items():
+        #             wandb.log({f"dagger-{step_id}/test_{k}": v})
             
-            print(f"Epoch {epoch} - Test Loss: {eval_stats['loss']:.4f}")
-
-            # if eval_stats['loss'] < best_test_loss:
-            #     best_test_loss = eval_stats['loss']
-            #     best_model = copy.deepcopy(model)
-            #     torch.save(best_model.state_dict(), os.path.join(step_save_dir, "best_model.pth"))
-            #     print(f"  -> Best model saved (loss: {best_test_loss:.4f})")
+        #     print(f"Epoch {epoch} - Test Loss: {eval_stats['loss']:.4f}")
 
         # Training
         model.train()
@@ -211,91 +532,88 @@ def train_step(
         # Save checkpoint
         if epoch % save_freq == 0:
             torch.save(model.state_dict(), os.path.join(step_save_dir, f"model_epoch_{epoch}.pth"))
-    
-    # Always return best model if available
-    # if best_model is not None:
-    #     return best_model
+
     return model
+# def data_step(save_dir, step_id, train_envs, test_envs, rollout_policy, horizon,
+#                normalize_actions=False, action_stats=None):
+#     """
+#     Collect data for one DAgger step.
+    
+#     Args:
+#         save_dir: Directory to save/load data
+#         step_id: Current DAgger iteration
+#         train_envs: Training environments
+#         test_envs: Test environments
+#         rollout_policy: Policy to use for data collection
+#         horizon: Horizon for data collection
+#         normalize_actions: Whether to normalize actions
+#         action_stats: Optional action stats from first iteration (mean, std)
+    
+#     Returns:
+#         train_dataset, test_dataset
+#     """
+#     step_save_dir = os.path.join(save_dir, f"dagger_step_{step_id}")
+#     os.makedirs(step_save_dir, exist_ok=True)
+    
+#     # Check if data already exists
+#     train_path = os.path.join(step_save_dir, "train_dataset.pkl")
+#     test_path = os.path.join(step_save_dir, "test_dataset.pkl")
+    
+#     if os.path.exists(train_path) and os.path.exists(test_path):
+#         print(f"Loading existing data from {step_save_dir}")
+#         with open(train_path, "rb") as f:
+#             train_dataset = pickle.load(f)
+#         with open(test_path, "rb") as f:
+#             test_dataset = pickle.load(f)
+#         # Re-apply normalization with provided stats if needed
+#         if normalize_actions and action_stats is not None:
+#             train_dataset.action_stats = action_stats
+#             train_dataset.action_mean = action_stats['mean']
+#             train_dataset.action_std = action_stats['std']
+#             train_dataset.normalize_actions = True
+#             test_dataset.action_stats = action_stats
+#             test_dataset.action_mean = action_stats['mean']
+#             test_dataset.action_std = action_stats['std']
+#             test_dataset.normalize_actions = True
+#     else:
+#         print(f"Collecting new data for step {step_id}")
+#         train_dataset, test_dataset = get_dagger_dataset(
+#             train_envs, test_envs, rollout_policy, horizon,
+#             normalize_actions=normalize_actions,
+#             action_stats=action_stats
+#         )
+#         with open(train_path, "wb") as f:
+#             pickle.dump(train_dataset, f)
+#         with open(test_path, "wb") as f:
+#             pickle.dump(test_dataset, f)
 
-
-def data_step(save_dir, step_id, train_envs, test_envs, rollout_policy, horizon,
-               normalize_actions=False, action_stats=None):
-    """
-    Collect data for one DAgger step.
-    
-    Args:
-        save_dir: Directory to save/load data
-        step_id: Current DAgger iteration
-        train_envs: Training environments
-        test_envs: Test environments
-        rollout_policy: Policy to use for data collection
-        horizon: Horizon for data collection
-        normalize_actions: Whether to normalize actions
-        action_stats: Optional action stats from first iteration (mean, std)
-    
-    Returns:
-        train_dataset, test_dataset
-    """
-    step_save_dir = os.path.join(save_dir, f"dagger_step_{step_id}")
-    os.makedirs(step_save_dir, exist_ok=True)
-    
-    # Check if data already exists
-    train_path = os.path.join(step_save_dir, "train_dataset.pkl")
-    test_path = os.path.join(step_save_dir, "test_dataset.pkl")
-    
-    if os.path.exists(train_path) and os.path.exists(test_path):
-        print(f"Loading existing data from {step_save_dir}")
-        with open(train_path, "rb") as f:
-            train_dataset = pickle.load(f)
-        with open(test_path, "rb") as f:
-            test_dataset = pickle.load(f)
-        # Re-apply normalization with provided stats if needed
-        if normalize_actions and action_stats is not None:
-            train_dataset.action_stats = action_stats
-            train_dataset.action_mean = action_stats['mean']
-            train_dataset.action_std = action_stats['std']
-            train_dataset.normalize_actions = True
-            test_dataset.action_stats = action_stats
-            test_dataset.action_mean = action_stats['mean']
-            test_dataset.action_std = action_stats['std']
-            test_dataset.normalize_actions = True
-    else:
-        print(f"Collecting new data for step {step_id}")
-        train_dataset, test_dataset = get_dagger_dataset(
-            train_envs, test_envs, rollout_policy, horizon,
-            normalize_actions=normalize_actions,
-            action_stats=action_stats
-        )
-        with open(train_path, "wb") as f:
-            pickle.dump(train_dataset, f)
-        with open(test_path, "wb") as f:
-            pickle.dump(test_dataset, f)
-
-    return train_dataset, test_dataset
+#     return train_dataset, test_dataset
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Context Accumulation Training")
-    
+    parser = argparse.ArgumentParser(
+        description="Context Accumulation Training for Procgen Maze")
+
     # Experiment
-    parser.add_argument("--exp_name", type=str, default="context_accumulator")
-    parser.add_argument("--env_name", type=str, default="darkroom-easy")
+    parser.add_argument("--exp_name", type=str, default="asteroid_procgen")
+    parser.add_argument("--env_name", type=str, default="maze")
     parser.add_argument("--seed", type=int, default=42)
-    
+
     # Data
-    parser.add_argument("--dataset_size", type=int, default=10000)
-    parser.add_argument("--dagger_steps", type=int, default=3)
-    parser.add_argument("--n_envs", type=int, default=10000)
-    
-    # Evaluation
-    parser.add_argument("--eval_episodes", type=int, default=40, help="Number of episodes for evaluation")
-    
+    parser.add_argument("--dataset_size", type=int, default=1000)
+    parser.add_argument("--dagger_steps", type=int, default=100)
+    parser.add_argument("--n_train_envs", type=int, default=16)
+    parser.add_argument("--n_eval_envs", type=int, default=20)
+    parser.add_argument("--visibility", type=int, default=7,
+                        help="Partial-obs window size (e.g. 7). "
+                             "None/0 = full 64x64 RGB obs.")
+
     # Model
-    parser.add_argument("--model_type", type=str, choices=["decision_transformer", "mlp"], default="decision_transformer")
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    
+    parser.add_argument("--n_embd", type=int, default=256)
+    parser.add_argument("--dropout", type=float, default=0.0)
+
     # Training
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -305,24 +623,20 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_clip", action="store_true")
     parser.add_argument("--eval_interval", type=float, default=0.1)
     parser.add_argument("--save_interval", type=float, default=0.1)
-    
+
     # Logging
     parser.add_argument("--log_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="dpt-sweep")
+    parser.add_argument("--wandb_project", type=str, default="asteroid-procgen")
     parser.add_argument("--wandb_entity", type=str, default=None)
-    
+
     # Paths
     parser.add_argument("--save_dir", type=str, default="./context_results")
-    
-    # Ant-specific arguments
-    parser.add_argument("--continuous_action", action="store_true", help="Use continuous actions (for ant env)")
-    parser.add_argument("--num_goals", type=int, default=50, help="Number of goals for ant env")
-    parser.add_argument("--horizon", type=int, default=None, help="Environment horizon (overrides default)")
-    parser.add_argument("--normalize_actions", action="store_true", help="Normalize actions (for continuous envs)")
 
     args = parser.parse_args()
 
-    # Initialize wandb
+    # ------------------------------------------------------------------
+    # Init
+    # ------------------------------------------------------------------
     if args.log_wandb:
         wandb.init(
             project=args.wandb_project,
@@ -331,7 +645,6 @@ if __name__ == "__main__":
             name=f"{args.exp_name}-{args.env_name}-seed{args.seed}",
         )
 
-    # Set seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -340,217 +653,196 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # Save directory
-    save_dir = os.path.join(args.save_dir, f"{args.exp_name}-{args.env_name}-seed{args.seed}")
+
+    save_dir = os.path.join(
+        args.save_dir,
+        f"{args.exp_name}-{args.env_name}-seed{args.seed}")
     os.makedirs(save_dir, exist_ok=True)
 
-    # Create environments
-    print(f"Creating environments: {args.env_name}")
-    env_kwargs = {}
-    if "ant" in args.env_name:
-        env_kwargs['num_goals'] = args.num_goals
-        if args.horizon:
-            env_kwargs['horizon'] = args.horizon
-    train_envs, test_envs, eval_envs = create_env(args.env_name, args.dataset_size, args.n_envs, **env_kwargs)
-    
-    # Get dimensions - try direct attributes first, then nested _envs
-    env = train_envs[0]
-    if hasattr(env, 'state_dim'):
-        state_dim = env.state_dim
-        action_dim = env.action_dim
-        env_horizon = env.horizon
-    elif hasattr(env, '_envs') and env._envs and env._envs[0] is not None:
-        state_dim = env._envs[0].state_dim
-        action_dim = env._envs[0].action_dim
-        env_horizon = env._envs[0].horizon
-    else:
-        raise ValueError("Could not determine state_dim/action_dim from environment")
-    
-    print(f"State dim: {state_dim}, Action dim: {action_dim}, Env horizon: {env_horizon}")
+    # ------------------------------------------------------------------
+    # Create environments  (VecProcgenMaze from procgen_env.py)
+    # ------------------------------------------------------------------
+    vis = args.visibility if args.visibility else None
+    train_env, eval_env = make_maze_envs(
+        n_train=args.n_train_envs,
+        n_eval=args.n_eval_envs,
+        train_start=0,
+        train_levels=1000,
+        eval_start=1000,
+        eval_levels=args.n_eval_envs,
+        visibility=vis,
+    )
+    obs_shape = tuple(train_env.observation_space.shape)  # (H, W, C)
+    action_dim = train_env.action_space.n  # 4
+    env_horizon = 500  # procgen maze max episode steps (easy mode)
+    print(f"Obs shape: {obs_shape}, Action dim: {action_dim}, "
+          f"Env horizon: {env_horizon}")
 
-    # Model configuration
-    model_horizon = env_horizon * args.dagger_steps
+    # ------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------
+    model_horizon = 2 * env_horizon
     model_args = {
         "horizon": model_horizon,
-        "state_dim": state_dim,
+        "obs": obs_shape,          # (H, W, C)
         "action_dim": action_dim,
         "n_layer": args.num_layers,
         "n_head": args.num_heads,
-        "n_embd": 256,
-        "dropout": 0.0, #åargs.dropout,
+        "n_embd": args.n_embd,
+        "dropout": args.dropout,
         "shuffle": True,
         "test": False,
-        "continuous_action": args.continuous_action,
-        "gmm_heads": 1,
-        # Continuous action settings (following robomimic)
-        "tanh_action": False,  # We use tanh on mean directly
-        "low_noise_eval": True,  # Use low noise at eval time
-        # std_min, std_max, init_std use robomimic defaults: (0.007, 7.5, 0.3)
     }
-    
     with open(os.path.join(save_dir, "model_args.pkl"), "wb") as f:
         pickle.dump(model_args, f)
-    
-    # Create model
-    model = DecisionTransformer(model_args).to(device)
+
+    model = DecisionTransformerCnn(model_args).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Initial data collection with expert
-    init_rollout_policy = get_rollout_policy("expert")
-    train_dataset, test_dataset = data_step(
-        save_dir, 0, train_envs, test_envs, init_rollout_policy, env_horizon,
-        normalize_actions=args.normalize_actions,
-        action_stats=None,  # Compute from first iteration data
-    )
-    current_horizon = env_horizon
-    
-    # Save action stats from first iteration (used for all subsequent iterations)
-    action_stats = train_dataset.get_action_stats()
-    if action_stats is not None:
-        print(f"Action normalization stats - Mean: {action_stats['mean']}, Std: {action_stats['std']}")
-        with open(os.path.join(save_dir, "action_stats.pkl"), "wb") as f:
-            pickle.dump(action_stats, f)
+    # ------------------------------------------------------------------
+    # Optimizer (single schedule across all dagger steps)
+    # ------------------------------------------------------------------
+    # total_steps = (args.dataset_size * args.num_epochs) // args.batch_size
+    # optimizer, scheduler = get_optimizer_scheduler(model, total_steps, args.lr, args.warmup_ratio)
 
-    # Compute total training steps for scheduler (reset each iteration)
-    total_steps = len(train_dataset) // args.batch_size * args.num_epochs
-    optimizer, scheduler = get_optimizer_scheduler(model, total_steps, args.lr, args.warmup_ratio)
-    
+    # # ------------------------------------------------------------------
+    # # Expert-p annealing
+    # # ------------------------------------------------------------------
+    # expert_p = 1.0
+    # min_expert_p = 0.05
+    # expert_p_decay = (expert_p - min_expert_p) / max(1, args.dagger_steps - 1)
+
+    # ------------------------------------------------------------------
     # Training loop
-    # Horizon progression: step 0 uses env_horizon, step 1 uses 2*env_horizon, etc.
+    # ------------------------------------------------------------------
+    # eval_policy = None  # None means pure expert on first step
+    training_datasets = []
+
+    exploration_steps_curriculum = [
+        (0, 0),
+        (5, 20),
+        (20, 50),
+        (50, 100),
+        (100, 200)
+    ]
+
+    sampling_ratio_curriculum = [
+        (1.0, ),
+        (0.25, 0.75),
+        (0.2, 0.3, 0.5),
+        (0.1, 0.2, 0.3, 0.4),
+        (0.05, 0.15, 0.25, 0.35, 0.4)
+    ]
+    lr_curriculum = [
+        1e-4,
+        1e-5,
+        1e-5,
+        1e-5,
+        1e-5,
+    ]
     for step_idx in range(args.dagger_steps):
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
+        # print(f"DAgger Step {step_idx}/{args.dagger_steps}  "
+            #   f"(expert_p={expert_p:.3f})")
+        # print step, exploration steps range, sampling ratio, lr
         print(f"DAgger Step {step_idx}/{args.dagger_steps}")
-        print(f"Training horizon: {current_horizon} (step {step_idx} = {step_idx + 1} episodes)")
-        print(f"Dataset size - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
-        print(f"{'='*60}")
-        
-        # Create data loaders
+        print(f"Exploration steps range: {exploration_steps_curriculum[step_idx]}")
+        print(f"Sampling ratio: {sampling_ratio_curriculum[step_idx]}")
+        print(f"Learning rate: {lr_curriculum[step_idx]:.2e}")
+        print(f"{'=' * 60}")
+
+        # 1. Collect data
+        data_collection_policy = TransformerCNNPolicy(
+            model=model,
+            context_horizon=model_horizon,
+            temp=0.1
+        )
+        all_trajs, current_train_dataset = get_procgen_dataset(
+            train_env,
+            n_trajs=args.dataset_size,
+            eval_policy=data_collection_policy,
+            # expert_p=expert_p,
+            exploration_steps_range=exploration_steps_curriculum[step_idx]
+        )
+        training_datasets.append(current_train_dataset)
+        print(f"Collected {len(current_train_dataset)} trajectories")
+
+        sampling_ratio = sampling_ratio_curriculum[step_idx]
+        print(f"Sampling ratio for training: {sampling_ratio}")
+
+        # 1b. Log a few annotated dataset trajectory videos
+        data_vid_dir = os.path.join(
+            save_dir, f"dagger_step_{step_idx}", "dataset_videos")
+        save_dataset_videos(
+            all_trajs, data_vid_dir, step_idx,
+            visibility=vis, n_videos=50,
+        )
+
+        train_dataset = MultiTrajectoryDataset(training_datasets, sampling_ratio)
+        weighted_sampler = CustomWeightedRandomSampler(train_dataset.weights, num_samples=len(train_dataset.weights), replacement=True)
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=collate_fn,
-        )
-        test_loader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=args.batch_size,
             shuffle=False,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn_procgen,
+            sampler=weighted_sampler
         )
-        
-        # Train
-        model = train_step(
-            step_idx,
-            model,
-            optimizer,
-            scheduler,
-            train_loader,
-            test_loader,
-            save_dir,
-            args,
-            device,
-            action_dim,
-            env_horizon,
-        )
-        
-        # Evaluate after training (use pure learned policy, no expert)
-        print(f"\nEvaluating after DAgger step {step_idx}...")
-        eval_policy = get_rollout_policy(
-            "decision_transformer",
-            model=model,
-            context_horizon=current_horizon,
-            env_horizon=env_horizon,
-            context_accumulation=False,  # Pure learned policy for evaluation
-            sliding_window=True if "nonepisodic" in args.env_name else False,
-            action_stats=action_stats,  # Pass action stats for denormalization
-        )
-        
-        eval_save_dir = os.path.join(save_dir, f"dagger_step_{step_idx}", "eval")
-        eval_horizon = args.eval_episodes * env_horizon
-        
-        eval_results = evaluate_policy_on_envs(
-            eval_envs=eval_envs,
-            policy=eval_policy,
-            eval_horizon=eval_horizon,
-            env_horizon=env_horizon,
-            save_dir=eval_save_dir,
-            env_name=args.env_name,
-            plot=True,
-        )
-        
-        # Log to wandb
-        if args.log_wandb:
-            # Log summary stats
-            final_mean = eval_results['mean_returns'][-1]
-            final_std = eval_results['std_returns'][-1]
-            wandb.log({
-                f"eval/step_{step_idx}_final_return": final_mean,
-                f"eval/step_{step_idx}_final_return_std": final_std,
-                f"eval/step_{step_idx}_mean_return": np.mean(eval_results['mean_returns']),
-            })
-            
-            # Log returns plot to wandb
-            fig, ax = plt.subplots(figsize=(10, 6))
-            episodes = np.arange(len(eval_results['mean_returns']))
-            ax.plot(episodes, eval_results['mean_returns'], label='Mean Return', linewidth=2)
-            ax.fill_between(
-                episodes,
-                eval_results['mean_returns'] - eval_results['std_returns'],
-                eval_results['mean_returns'] + eval_results['std_returns'],
-                alpha=0.2,
-            )
-            ax.set_xlabel('Episode')
-            ax.set_ylabel('Return')
-            ax.set_title(f'Eval Returns - DAgger Step {step_idx}')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            wandb.log({f"eval/step_{step_idx}_returns_plot": wandb.Image(fig)})
-            plt.close(fig)
-            
-            # Log episode returns as a table
-            for ep_idx, (mean_ret, std_ret) in enumerate(zip(eval_results['mean_returns'], eval_results['std_returns'])):
-                wandb.log({
-                    f"eval_step_{step_idx}/episode_{ep_idx}_return": mean_ret,
-                })
-        
-        print(f"Evaluation complete - Final return: {eval_results['mean_returns'][-1]:.2f} ± {eval_results['std_returns'][-1]:.2f}")
-        
-        # Prepare for next step
-        current_horizon = env_horizon * (step_idx + 2)
-        
-        # Create policy for data collection
-        step_policy = get_rollout_policy(
-            "decision_transformer",
-            model=model,
-            context_horizon=current_horizon,
-            env_horizon=env_horizon,
-            context_accumulation=True,
-            action_stats=action_stats,  # Pass action stats for denormalization
-        )
-        
-        # Collect new data and merge (if not last step)
-        if step_idx < args.dagger_steps - 1:
-            step_train_dataset, step_test_dataset = data_step(
-                save_dir, step_idx + 1, train_envs, test_envs, step_policy, current_horizon,
-                normalize_actions=args.normalize_actions,
-                action_stats=action_stats,  # Use stats from first iteration!
-            )
-            
-            # Always merge with previous datasets (preserves original action stats)
-            train_dataset = merge_sequence_datasets(train_dataset, step_train_dataset)
-            test_dataset = merge_sequence_datasets(test_dataset, step_test_dataset)
-            
-            # Always reset optimizer for next iteration
-            total_steps = len(train_dataset) // args.batch_size * args.num_epochs
-            optimizer, scheduler = get_optimizer_scheduler(model, total_steps, args.lr, args.warmup_ratio)
 
+        # 2. Train
+        total_steps = (len(train_dataset.weights) * args.num_epochs) // args.batch_size
+        optimizer, scheduler = get_optimizer_scheduler(model, total_steps, lr_curriculum[step_idx], args.warmup_ratio)
+
+        model = train_step(
+            step_idx, model, optimizer, scheduler,
+            train_loader, save_dir, args, device,
+            action_dim, env_horizon,
+        )
+
+        # 3. Build evaluation policy from trained model
+        print(f"\nEvaluating after DAgger step {step_idx}...")
+        eval_policy = TransformerCNNPolicy(
+            model=model,
+            context_horizon=model_horizon,
+            temp=0.1
+        )
+        # eval_policy_adapter = _PolicyAdapter(transformer_policy)
+
+        # 4. Evaluate
+        eval_save_dir = os.path.join(
+            save_dir, f"dagger_step_{step_idx}", "eval")
+        mean_ret, std_ret = evaluate_policy_on_envs_procgen(
+            # eval_envs=eval_env,
+            eval_envs=train_env,  # evaluate on training envs to see improvement across steps
+            policy=eval_policy,
+            eval_horizon=env_horizon,
+            save_dir=eval_save_dir,
+            dagger_step=step_idx,
+        )
+
+        print(f"Eval return: {mean_ret:.2f} ± {std_ret:.2f}")
+
+        if args.log_wandb:
+            wandb.log({
+                "dagger_step": step_idx,
+                "eval/mean_return": mean_ret,
+                "eval/std_return": std_ret,
+                # "expert_p": expert_p,
+                "exploration_steps_range": exploration_steps_curriculum[step_idx],
+                "sampling_ratio": sampling_ratio,
+                "learning_rate": lr_curriculum[step_idx],
+            })
+
+        # 5. Decay expert probability
+        # expert_p = max(min_expert_p, expert_p - expert_p_decay)
+        # print(f"Expert probability for next step: {expert_p:.4f}")
+
+    # ------------------------------------------------------------------
     # Save final model
+    # ------------------------------------------------------------------
     torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pth"))
     print(f"\nTraining complete! Results saved to {save_dir}")
-    
+
     if args.log_wandb:
         wandb.finish()

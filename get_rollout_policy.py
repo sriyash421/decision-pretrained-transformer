@@ -377,3 +377,117 @@ def get_rollout_policy(policy_type, model=None, temp=1.0, context_horizon=None,
         )
     else:
         raise ValueError(f"Unknown policy type: {policy_type}")
+
+
+class TransformerCNNPolicy():
+    """
+    Policy using a trained Decision Transformer.
+    Accumulates context over time and uses it to predict actions.
+    """
+
+    def __init__(self, model, temp, context_horizon):
+        """
+        Args:
+            model: Trained Decision Transformer model
+            temp: Temperature for action sampling (lower = more greedy)
+            context_horizon: Maximum context length (defaults to model horizon)
+            env_horizon: Steps per episode
+            sliding_window: If True, use sliding window for context trimming
+            use_value_guide: If True, use value-guided action selection
+            action_stats: Optional dict with 'mean' and 'std' for action denormalization
+        """
+        super().__init__()
+        self.model = model
+        self.temp = temp
+        self.context_horizon = context_horizon
+        
+        # Context buffers
+        self.context_states = None
+        self.context_actions = None
+        self.context_rewards = None
+        self.context_dones = None
+
+    def reset(self, resets):
+        """Clear context buffers."""
+        if self.context_states is None:
+            self.context_states = [[] for _ in range(len(resets))]
+            self.context_actions = [[] for _ in range(len(resets))]
+            self.context_rewards = [[] for _ in range(len(resets))]
+            self.context_dones = [[] for _ in range(len(resets))]
+        else:
+            for i, reset in enumerate(resets):
+                if reset:
+                    self.context_states[i] = []
+                    self.context_actions[i] = []
+                    self.context_rewards[i] = []
+                    self.context_dones[i] = []
+
+    def _get_context_tensors(self, current_states):
+        # """Convert context lists to tensors, trimmed to context_horizon."""
+        # states = torch.from_numpy(np.stack(self.context_states, axis=1)).float().to(device)
+        # actions = torch.from_numpy(np.stack(self.context_actions, axis=1)).float().to(device)
+        # rewards = torch.from_numpy(np.stack(self.context_rewards, axis=1)).float().to(device)
+        # dones = torch.from_numpy(np.stack(self.context_dones, axis=1)).float().to(device)
+        
+        # # Trim to context horizon if needed
+        # if states.shape[1] > self.model.horizon - 1:
+        #     if self.sliding_window:
+        #         # Simple sliding window
+        #         states = states[:, -(self.context_horizon - 1):]
+        #         actions = actions[:, -(self.context_horizon - 1):]
+        #         rewards = rewards[:, -(self.context_horizon - 1):]
+        #         dones = dones[:, -(self.context_horizon - 1):]
+        #     else:
+        #         # Trim to episode boundary
+        #         trimmed_dones = dones[:, -self.context_horizon:]
+        #         first_done_index = (
+        #             torch.argmax(trimmed_dones, dim=1) + 1 
+        #             + (states.shape[1] - self.context_horizon)
+        #         )
+        #         start_idx = first_done_index.min()
+        #         states = states[:, start_idx:]
+        #         actions = actions[:, start_idx:]
+        #         rewards = rewards[:, start_idx:]
+        #         dones = dones[:, start_idx:]
+        
+        # return states, actions, rewards, dones
+        """Convert list to padded tensors"""
+        batch_size = len(self.context_states)
+        max_len = max(len(s) for s in self.context_states)+1  # +1 for current state
+        states = torch.zeros((batch_size, max_len, *current_states[0].shape), dtype=torch.float32).to(device)
+        actions = torch.zeros((batch_size, max_len, self.model.action_dim), dtype=torch.float32).to(device)
+        rewards = torch.zeros((batch_size, max_len), dtype=torch.float32).to(device)
+        dones = torch.zeros((batch_size, max_len), dtype=torch.float32).to(device)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.float32).to(device)
+        for i in range(batch_size):
+            seq_len = len(self.context_states[i])
+            if seq_len > 0:
+                states[i, :seq_len] = torch.from_numpy(np.stack(self.context_states[i], axis=0)).float().to(device)
+                actions[i, 1:seq_len+1] = torch.from_numpy(np.stack(self.context_actions[i], axis=0)).float().to(device)
+                rewards[i, 1:seq_len+1] = torch.from_numpy(np.array(self.context_rewards[i])).float().to(device)
+                dones[i, 1:seq_len+1] = torch.from_numpy(np.array(self.context_dones[i])).float().to(device)
+            states[i, seq_len] = torch.from_numpy(current_states[i]).float().to(device)  # Add current state as last in sequence
+            attention_mask[i, :seq_len+1] = 1.0  # Mask for valid tokens
+        return states, actions, rewards, dones, attention_mask
+        
+
+    @torch.no_grad()
+    def get_action(self, states):
+        """Get action using the transformer model."""
+        self.model.eval()
+        # current_states = torch.from_numpy(states).float().to(device)
+        input_states, input_actions, input_rewards, input_dones, attention_mask = self._get_context_tensors(states)
+        # print("Input states shape:", input_states.shape)
+        # print("Input actions shape:", input_actions.shape)
+        # print("Input rewards shape:", input_rewards.shape)
+        # print("Input dones shape:", input_dones.shape)
+        action_output = self.model.get_action(
+            input_states, input_actions, input_rewards, input_dones, attention_mask
+        )
+        logits = action_output.cpu().numpy()
+        probs = scipy.special.softmax(logits / self.temp, axis=1)
+        batch_size, num_actions = probs.shape
+        actions = np.array([
+            np.random.choice(num_actions, p=probs[i]) for i in range(batch_size)
+        ]) # Batch of action indices
+        return actions
