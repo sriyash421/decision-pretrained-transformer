@@ -315,13 +315,16 @@ class VecProcgenMaze:
         agent is revealed; all other cells are −1 in every channel.
     """
 
-    def __init__(self, env, render_mode=None, visibility=None):
+    def __init__(self, env, render_mode=None, visibility=None,
+                 fixed_maze=False, goal_set=None):
         self.env_fn = env
         env = self.env_fn()
         self.env = env
         self.n = env.num
         self.render_mode = render_mode
         self.visibility = visibility
+        self.fixed_maze = fixed_maze
+        self.goal_set = goal_set  # list of (x, y) goal positions to sample from
 
         # world_dim is determined after the first reset; placeholder 15 (easy)
         self._world_dim = 15
@@ -335,6 +338,11 @@ class VecProcgenMaze:
         self._last_rgb = [None] * self.n
         self._nav = [None] * self.n
         self._wd = [None] * self.n
+
+        # fixed maze cache
+        self._fixed_nav = None
+        self._fixed_wd = None
+        self._free_cells = None
 
     def _solve_all(self):
         for i in range(self.n):
@@ -358,6 +366,36 @@ class VecProcgenMaze:
             self._opt[i] = _q_iteration(nav, gpos, wd)
         else:
             self._opt[i] = None
+
+    def _init_fixed_maze(self):
+        """Cache maze layout from seed 42."""
+        tmp = ProcgenGym3Env(
+            num=1, env_name="maze", start_level=42, num_levels=1,
+            distribution_mode="easy", center_agent=True,
+            restrict_themes=True, use_backgrounds=False,
+            use_monochrome_assets=True,
+        )
+        nav, _, _, wd = _extract_grid(tmp, 0)
+        self._fixed_nav = nav.copy()
+        self._fixed_wd = wd
+        self._world_dim = wd
+        self.observation_space = spaces.Box(
+            -1, 1, (wd, wd, 3), np.float32)
+        self._free_cells = [
+            (x, y) for y in range(wd) for x in range(wd) if nav[y, x]
+        ]
+
+    def _reset_sub_env(self, i):
+        """Reset sub-env i with random start and goal from goal_set."""
+        self._nav[i] = self._fixed_nav.copy()
+        self._wd[i] = self._fixed_wd
+        # sample goal from goal_set
+        gpos = self.goal_set[np.random.randint(len(self.goal_set))]
+        self._gpos[i] = gpos
+        # sample start from free cells (not goal)
+        free = [c for c in self._free_cells if c != gpos]
+        self._apos[i] = free[np.random.randint(len(free))]
+        self._opt[i] = _q_iteration(self._nav[i], gpos, self._fixed_wd)
 
     # ------------------------------------------------------------------
     #  Grid observation builder
@@ -409,18 +447,46 @@ class VecProcgenMaze:
     def reset(self):
         self.env = self.env_fn()
         _, ob, _ = self.env.observe()
-        self._solve_all()
-        # update world_dim / observation_space from first env
-        if self._wd[0] is not None and self._wd[0] != self._world_dim:
-            self._world_dim = self._wd[0]
-            self.observation_space = spaces.Box(
-                -1, 1, (self._world_dim, self._world_dim, 3), np.float32)
+
+        if self.fixed_maze:
+            if self._fixed_nav is None:
+                self._init_fixed_maze()
+            for i in range(self.n):
+                self._reset_sub_env(i)
+        else:
+            self._solve_all()
+            if self._wd[0] is not None and self._wd[0] != self._world_dim:
+                self._world_dim = self._wd[0]
+                self.observation_space = spaces.Box(
+                    -1, 1, (self._world_dim, self._world_dim, 3), np.float32)
+
         raw_rgb = ob["rgb"]
         obs = self._build_grid_obs()
         infos = self._build_infos(raw_rgb=raw_rgb)
         return obs, infos
 
     def step(self, actions):
+        if self.fixed_maze:
+            # simulate movement ourselves
+            rews = np.zeros(self.n, dtype=np.float32)
+            dones = np.zeros(self.n, dtype=bool)
+            for i in range(self.n):
+                ax, ay = self._apos[i]
+                a = int(actions[i])
+                nx, ny = ax + DX[a], ay + DY[a]
+                wd = self._fixed_wd
+                if 0 <= nx < wd and 0 <= ny < wd and self._nav[i][ny, nx]:
+                    self._apos[i] = (nx, ny)
+                if self._apos[i] == self._gpos[i]:
+                    rews[i] = 10.0
+                    dones[i] = True
+                    self._reset_sub_env(i)
+            _, ob, _ = self.env.observe()
+            raw_rgb = ob["rgb"]
+            obs = self._build_grid_obs()
+            infos = self._build_infos(raw_rgb=raw_rgb)
+            return obs, rews, dones, infos
+
         pa = np.array(
             [ACT_MAP[int(a)] for a in actions], dtype=np.int32
         )
@@ -478,6 +544,18 @@ class VecProcgenMaze:
         return ob["rgb"][idx]
 
 
+def _get_free_cells_seed42():
+    """Extract free cells from maze at seed 42."""
+    tmp = ProcgenGym3Env(
+        num=1, env_name="maze", start_level=42, num_levels=1,
+        distribution_mode="easy", center_agent=True,
+        restrict_themes=True, use_backgrounds=False,
+        use_monochrome_assets=True,
+    )
+    nav, _, _, wd = _extract_grid(tmp, 0)
+    return [(x, y) for y in range(wd) for x in range(wd) if nav[y, x]]
+
+
 def make_maze_envs(
     n_train=8,
     n_eval=20,
@@ -486,6 +564,8 @@ def make_maze_envs(
     eval_start=100,
     eval_levels=20,
     visibility=None,
+    fixed_maze=False,
+    train_goal_ratio=0.8,
 ):
     """Create train and eval ProcgenMaze envs wrapped in gymnasium style.
 
@@ -495,8 +575,22 @@ def make_maze_envs(
         If set, observations are ``(world_dim, world_dim, 3)`` grids with
         partial visibility masking (-1 for unseen cells).
         See :class:`VecProcgenMaze`.
+    fixed_maze : bool
+        If True, use a single maze (seed 42) and only randomize start/goal.
+    train_goal_ratio : float
+        Fraction of free cells to use as train goals (rest for eval).
     """
-    train_g3 = lambda : ProcgenGym3Env(
+    # build goal sets if fixed_maze
+    train_goals, eval_goals = None, None
+    if fixed_maze:
+        free = _get_free_cells_seed42()
+        np.random.seed(42)
+        idxs = np.random.permutation(len(free))
+        n_train_goals = int(len(free) * train_goal_ratio)
+        train_goals = [free[i] for i in idxs[:n_train_goals]]
+        eval_goals = [free[i] for i in idxs[n_train_goals:]]
+
+    train_g3 = lambda: ProcgenGym3Env(
         num=n_train,
         env_name="maze",
         start_level=train_start,
@@ -507,7 +601,7 @@ def make_maze_envs(
         use_backgrounds=False,
         use_monochrome_assets=True,
     )
-    eval_g3 = lambda : ProcgenGym3Env(
+    eval_g3 = lambda: ProcgenGym3Env(
         num=n_eval,
         env_name="maze",
         start_level=eval_start,
@@ -519,9 +613,11 @@ def make_maze_envs(
         render_mode="rgb_array",
         use_monochrome_assets=True,
     )
-    train_env = VecProcgenMaze(train_g3, visibility=visibility)
+    train_env = VecProcgenMaze(train_g3, visibility=visibility,
+                                fixed_maze=fixed_maze, goal_set=train_goals)
     eval_env = VecProcgenMaze(eval_g3, render_mode="rgb_array",
-                              visibility=visibility)
+                              visibility=visibility,
+                              fixed_maze=fixed_maze, goal_set=eval_goals)
     return train_env, eval_env
 
 

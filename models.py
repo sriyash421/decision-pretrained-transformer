@@ -653,21 +653,32 @@ class DecisionTransformerCnn(nn.Module):
         self.transformer = GPT2Model(gpt2_config)
         obs_shape = config['obs']  # (H, W, C), (15x15x3)
         self.cnn_encoder = nn.Sequential(
-            nn.Conv2d(obs_shape[2], 64, kernel_size=4, stride=2),  # (H/2, W/2, 64)
-            nn.ReLU(),
-            nn.Conv2d(64, 32, kernel_size=4, stride=2),  # (H/4, W/4, 32)
-            nn.ReLU(),
+            # nn.Conv2d(obs_shape[2], 64, kernel_size=3, stride=1),  # (H/2, W/2, 64)
+            # nn.ReLU(),
+            # nn.Conv2d(64, 32, kernel_size=3, stride=1),  # (H/4, W/4, 32)
+            # nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(128, config['n_embd']),  # (n_embd)
             # nn.Linear(obs_shape[0]//4 * obs_shape[1]//4 * 32, config['n_embd']),  # (n_embd)
             # nn.ReLU(),
         )
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, obs_shape[2], obs_shape[0], obs_shape[1])
+            dummy_output = self.cnn_encoder(dummy_input)
+            state_dim = dummy_output.shape[1]
+            self.obs_proj = nn.Linear(state_dim, config['n_embd'])
+        self.cnn_encoder = nn.Sequential(
+            self.cnn_encoder,
+            self.obs_proj,
+            nn.ReLU(),
+        )
+        self.action_embeds = nn.Embedding(config['action_dim'], config['n_embd'])
+
         # state_dim = np.prod(obs_shape)
         state_dim = config['n_embd']
-        action_dim = 4
+        action_dim = config['action_dim']
         n_embd = config['n_embd']
         self.embed_transition = nn.Linear(
-            state_dim + action_dim + 2, n_embd)
+            2*config['n_embd'], n_embd)
         self.embed_ln = nn.LayerNorm(n_embd)
         self.pred_actions = nn.Linear(n_embd, action_dim)
         
@@ -679,25 +690,35 @@ class DecisionTransformerCnn(nn.Module):
         B,T = x['states'].shape[0], x['states'].shape[1]
         # states = x['states'].view(B, T, self.state_dim)
         states = x['states'].view(B * T, *x['states'].shape[2:])  # (B*T, H, W, C)
+        # breakpoint()
         states = states.permute(0, 3, 1, 2)
         states = self.cnn_encoder(states)  # (B*T, n_embd)
         states = states.view(B, T, self.n_embd)  # (B, T, n_embd)
+        
         actions = x['actions']
-        rewards = x['rewards']
-        dones = x['dones']
         input_actions = torch.cat([
-            torch.zeros(states.shape[0], 1, self.action_dim).to(device),
-            actions[:, :-1, :],
+            torch.zeros((actions.shape[0], 1), dtype=torch.long).to(device),
+            actions[:, :-1],
         ], dim=1)
-        input_rewards = torch.cat([
-            torch.zeros(states.shape[0], 1).to(device),
-            rewards[:, :-1],
-        ], dim=1)
-        input_dones = torch.cat([
-            torch.zeros(states.shape[0], 1).to(device),
-            dones[:, :-1],
-        ], dim=1)
-        inputs_ = torch.cat([states, input_actions, input_rewards.unsqueeze(-1), input_dones.unsqueeze(-1)], dim=2)
+        # breakpoint()
+        # input_actions = input_actions.argmax(dim=-1)
+        actions = self.action_embeds(input_actions)
+        # rewards = x['rewards']
+        # dones = x['dones']
+        # input_actions = torch.cat([
+        #     torch.zeros(states.shape[0], 1, self.action_dim).to(device),
+        #     actions[:, :-1, :],
+        # ], dim=1)
+        # input_rewards = torch.cat([
+        #     torch.zeros(states.shape[0], 1).to(device),
+        #     rewards[:, :-1],
+        # ], dim=1)
+        # input_dones = torch.cat([
+        #     torch.zeros(states.shape[0], 1).to(device),
+        #     dones[:, :-1],
+        # ], dim=1)
+        # inputs_ = torch.cat([states, input_actions, input_rewards.unsqueeze(-1), input_dones.unsqueeze(-1)], dim=2)
+        inputs_ = torch.cat([states, actions], dim=2)
         inputs = self.embed_transition(inputs_)
         inputs = self.embed_ln(inputs)
 
@@ -713,7 +734,9 @@ class DecisionTransformerCnn(nn.Module):
         states = states.permute(0, 3, 1, 2)
         states = self.cnn_encoder(states)  # (B*T, n_embd)
         states = states.view(B, T, self.n_embd)  # (B, T, n_embd)
-        inputs_ = torch.cat([states, actions, rewards.unsqueeze(-1), dones.unsqueeze(-1)], dim=2)
+        actions = self.action_embeds(actions)
+        # inputs_ = torch.cat([states, actions, rewards.unsqueeze(-1), dones.unsqueeze(-1)], dim=2)
+        inputs_ = torch.cat([states, actions], dim=2)
         inputs = self.embed_transition(inputs_)
         inputs = self.embed_ln(inputs)
         transformer_outputs = self.transformer(inputs_embeds=inputs, attention_mask=attention_mask)
@@ -721,3 +744,118 @@ class DecisionTransformerCnn(nn.Module):
         seq_len = attention_mask.sum(dim=1).long()  # [B]
         last_preds = preds[torch.arange(B), seq_len - 1]  # [B, A]
         return last_preds
+
+
+# class DecisionTransformerCnn(nn.Module):
+#     """Decision Transformer with image/grid encoder for observations.
+
+#     Observations arrive as (H, W, C) uint8/float from procgen / gymnasium.
+
+#     Encoder selection (automatic, based on spatial size):
+#     * **H ≥ 32** (e.g. 64×64 RGB): Atari-style CNN
+#       Conv(k=8,s=4) → Conv(k=4,s=2) → Conv(k=3,s=1) → Linear.
+#     * **H < 32** (e.g. 7×7 binary grid): lightweight MLP
+#       Flatten → Linear → ReLU → Linear → ReLU.
+
+#     Config must contain:
+#         obs: tuple (H, W, C) – raw observation shape
+#         n_embd: int – hidden dimension (encoder output dim)
+#         ... (all keys required by DecisionTransformer)
+#     """
+
+#     def __init__(self, config):
+#         super().__init__()
+#         gpt2_config = GPT2Config(
+#             n_positions=config['horizon'],
+#             n_ctx=config['horizon'],
+#             n_embd=config['n_embd'],
+#             n_layer=config['n_layer'],
+#             n_head=config['n_head'],
+#             resid_pdrop=config['dropout'],
+#             embd_pdrop=config['dropout'],
+#             attn_pdrop=config['dropout'],
+#             use_cache=False,
+#         )
+#         self.transformer = GPT2Model(gpt2_config)
+#         obs_shape = config['obs']  # (H, W, C), (15x15x3)
+#         self.cnn_encoder = nn.Sequential(
+#             nn.Conv2d(obs_shape[2], 64, kernel_size=4, stride=2),  # (H/2, W/2, 64)
+#             nn.ReLU(),
+#             nn.Conv2d(64, 32, kernel_size=4, stride=2),  # (H/4, W/4, 32)
+#             nn.ReLU(),
+#             nn.Flatten(),
+#             nn.Linear(512, config['n_embd']),  # (n_embd)
+#             # nn.Linear(obs_shape[0]//4 * obs_shape[1]//4 * 32, config['n_embd']),  # (n_embd)
+#             # nn.ReLU(),
+#         )
+#         self.action_proj = nn.Linear(config['n_embd'], 4)
+#         # state_dim = np.prod(obs_shape)
+#         # state_dim = config['n_embd']
+#         # action_dim = 4
+#         n_embd = config['n_embd']
+#         # self.embed_transition = nn.Linear(
+#         #     state_dim + action_dim + 2, n_embd)
+#         # self.embed_ln = nn.LayerNorm(n_embd)
+#         # self.pred_actions = nn.Linear(n_embd, action_dim)
+        
+#         # self.state_dim = state_dim
+#         # self.action_dim = action_dim
+#         self.n_embd = n_embd
+
+#     def forward(self, x, **kwargs):
+#         B,T = x['states'].shape[0], x['states'].shape[1]
+#         # states = x['states'].view(B, T, self.state_dim)
+#         states = x['states'].view(B * T, *x['states'].shape[2:])  # (B*T, H, W, C)
+#         states = states.permute(0, 3, 1, 2)
+#         states = self.cnn_encoder(states)  # (B*T, n_embd)
+#         states = states.view(B, T, self.n_embd)  # (B, T, n_embd)
+#         actions = self.action_proj(states)  # (B, T, 4)
+#         return actions
+#         # actions = x['actions']
+#         # rewards = x['rewards']
+#         # dones = x['dones']
+#         # input_actions = torch.cat([
+#         #     torch.zeros(states.shape[0], 1, self.action_dim).to(device),
+#         #     actions[:, :-1, :],
+#         # ], dim=1)
+#         # input_rewards = torch.cat([
+#         #     torch.zeros(states.shape[0], 1).to(device),
+#         #     rewards[:, :-1],
+#         # ], dim=1)
+#         # input_dones = torch.cat([
+#         #     torch.zeros(states.shape[0], 1).to(device),
+#         #     dones[:, :-1],
+#         # ], dim=1)
+#         # inputs_ = torch.cat([states, input_actions, input_rewards.unsqueeze(-1), input_dones.unsqueeze(-1)], dim=2)
+#         # inputs = self.embed_transition(inputs_)
+#         # inputs = self.embed_ln(inputs)
+
+#         # transformer_outputs = self.transformer(inputs_embeds=inputs)
+#         # preds = self.pred_actions(transformer_outputs['last_hidden_state']) # B x T x A
+#         # return preds
+
+#     def get_action(self, states, actions, rewards, dones, attention_mask):
+#         # current_state: [B, H, W, C] -> [B, hidden_dim]
+#         # B,T = states.shape[0], states.shape[1]
+#         # # states = states.view(B, T, self.state_dim)
+#         # states = states.view(B * T, *states.shape[2:])  # (B*T, H, W, C)
+#         # states = states.permute(0, 3, 1, 2)
+#         # states = self.cnn_encoder(states)  # (B*T, n_embd)
+#         # states = states.view(B, T, self.n_embd)  # (B, T, n_embd)
+#         # inputs_ = torch.cat([states, actions, rewards.unsqueeze(-1), dones.unsqueeze(-1)], dim=2)
+#         # inputs = self.embed_transition(inputs_)
+#         # inputs = self.embed_ln(inputs)
+#         # transformer_outputs = self.transformer(inputs_embeds=inputs, attention_mask=attention_mask)
+#         # preds = self.pred_actions(transformer_outputs['last_hidden_state']) # B x T x A
+#         # seq_len = attention_mask.sum(dim=1).long()  # [B]
+#         # last_preds = preds[torch.arange(B), seq_len - 1]  # [B, A]
+#         # return last_preds
+#         B,T = states.shape[0], states.shape[1]
+#         states = states.view(B * T, *states.shape[2:])  # (B*T, H, W, C)
+#         states = states.permute(0, 3, 1, 2)
+#         states = self.cnn_encoder(states)  # (B*T, n_embd)
+#         states = states.view(B, T, self.n_embd)
+#         actions = self.action_proj(states)  # (B, T, 4)
+#         seq_len = attention_mask.sum(dim=1).long()  # [B]
+#         last_actions = actions[torch.arange(B), seq_len - 1]  # [B, 4]
+#         return last_actions

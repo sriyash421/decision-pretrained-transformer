@@ -29,16 +29,17 @@ from PIL import Image
 
 from get_rollout_policy import TransformerCNNPolicy
 from models import DecisionTransformerCnn
-from procgen_env import make_maze_envs, _render_grid_obs
+from maze_env import make_maze_envs, _render_grid_obs
 
 
 # ---------------------------------------------------------------------------
 #  Evaluation
 # ---------------------------------------------------------------------------
 
+
 def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
-                                    save_dir, dagger_step, plot=True,
-                                    panel_size=256):
+                                    save_dir, dagger_step, eval_name,
+                                    plot=True, panel_size=256):
     """
     Evaluate *policy* on the VecProcgenMaze *eval_envs*.
 
@@ -58,11 +59,12 @@ def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
     n = eval_envs.n
     done_flag = np.zeros(n, dtype=bool)
     episode_rewards = np.zeros(n, dtype=np.float32)
+    successes = np.zeros(n, dtype=bool)
     # each frame is (partial_rgb, full_rgb) – both uint8
     episode_frames = [[] for _ in range(n)]
 
     ps = panel_size
-
+    pbar = tqdm.tqdm(total=n, desc=f"Evaluating {eval_name}", unit="step")
     for t in range(eval_horizon):
         for i in range(n):
             if not done_flag[i]:
@@ -71,26 +73,35 @@ def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
                 partial = np.array(Image.fromarray(partial).resize(
                     (ps, ps), Image.NEAREST))
                 # full RGB from procgen
-                rgb = infos[i].get("rgb", infos[i].get("full_obs"))
+                rgb = infos[i]["full_obs"]
+                rgb = _render_grid_obs(rgb) 
+                # if rgb is None:
+                #     rgb = _render_grid_obs(obs[i])
                 rgb = np.array(Image.fromarray(rgb).resize(
                     (ps, ps), Image.NEAREST))
                 episode_frames[i].append((partial, rgb))
 
+        # prev_obs = obs
         actions = policy.get_action(obs)
-        obs, rewards, dones, infos = eval_envs.step(actions)
+        next_obs, rewards, dones, infos = eval_envs.step(actions)
+        policy.update_context(obs, actions, rewards, dones)
         policy.reset(dones)
+        obs = next_obs
 
         for i in range(n):
             if not done_flag[i]:
                 episode_rewards[i] += rewards[i]
             if dones[i] and not done_flag[i]:
                 done_flag[i] = True
+                pbar.update(1)
+                if rewards[i] > 0:
+                    successes[i] = True
 
         if done_flag.all():
             break
 
     # save mp4 videos for up to 5 envs
-    for i in range(min(5, n)):
+    for i in range(min(n, 5)):
         if len(episode_frames[i]) == 0:
             continue
         vid_path = os.path.join(save_dir, f"episode_{i}.mp4")
@@ -108,14 +119,14 @@ def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
 
         if wandb.run is not None:
             wandb.log({
-                f"Eval-Step{dagger_step}/episode_{i}_video":
+                f"step{dagger_step}_eval/video_{eval_name}_episode_{i}_video":
                     wandb.Video(vid_path, format="mp4")
             })
 
     mean_ret = float(np.mean(episode_rewards))
     std_ret = float(np.std(episode_rewards))
-    return mean_ret, std_ret
-
+    success_rate = float(np.mean(successes))
+    return mean_ret, std_ret, success_rate
 
 # ---------------------------------------------------------------------------
 #  Dataset
@@ -124,34 +135,111 @@ def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
 class TrajectoryDataset(torch.utils.data.Dataset):
     """Dataset of variable-length trajectories collected from procgen maze."""
 
-    def __init__(self, trajectories):
+    def __init__(self, trajectories, sample_steps=False):
         self.trajectories = trajectories
+        self.total_steps = sum(len(traj['actions']) for traj in trajectories)
+        self.sample_steps = False
+        self.step_to_traj = []
+        if self.sample_steps:
+            for traj_idx, traj in enumerate(trajectories):
+                for step_idx in range(len(traj['actions'])):
+                    self.step_to_traj.append((traj_idx, step_idx))
 
     def __len__(self):
-        return len(self.trajectories)
+        return len(self.trajectories) if not self.sample_steps else self.total_steps
 
     def __getitem__(self, idx):
-        traj = self.trajectories[idx]
+        if self.sample_steps:
+            traj_idx, step_idx = self.step_to_traj[idx]
+            traj = self.trajectories[traj_idx]
+            steps = np.array([step_idx])
+        else:
+            traj = self.trajectories[idx]
+            steps = np.arange(len(traj['actions'])) # (T,)
         return {
             # observations: (T, H, W, C) float32
             "observations": torch.tensor(
-                np.array(traj['observations']), dtype=torch.float32),
+                np.array(traj['observations'])[steps], dtype=torch.float32),
             # actions: (T,) long  – discrete action ids 0..3
             "actions": torch.tensor(
-                np.array(traj['actions']), dtype=torch.long),
+                np.array(traj['actions'])[steps], dtype=torch.long),
             # rewards: (T,)
             "rewards": torch.tensor(
-                np.array(traj['rewards']), dtype=torch.float32),
+                np.array(traj['rewards'])[steps], dtype=torch.float32),
             # dones: (T,)
             "dones": torch.tensor(
-                np.array(traj['dones']), dtype=torch.float32),
+                np.array(traj['dones'])[steps], dtype=torch.float32),
             # expert_actions: (T,) long
             # "expert_actions": torch.tensor(
             #     np.array(traj['expert_actions']), dtype=torch.long),
             # expert_mask: (T,) float – 1 where expert was used
             "expert_mask": torch.tensor(
-                np.array(traj['expert_mask']), dtype=torch.float32),
+                np.array(traj['expert_mask'])[steps], dtype=torch.float32),
         }
+
+# class TrajectoryDataset(torch.utils.data.Dataset):
+#     """Dataset of variable-length trajectories collected from procgen maze."""
+
+#     def __init__(self, trajectories, sample_steps=False):
+#         self.trajectories = trajectories
+#         expert_masks = [traj['expert_mask'] for traj in trajectories]
+#         self.supervision_steps = sum(np.sum(mask) for mask in expert_masks)
+#         self.idx_to_traj_step = []
+#         for traj_idx, traj in enumerate(trajectories):
+#             for step_idx in range(len(traj['actions'])):
+#                 if traj['expert_mask'][step_idx]:  # only include steps with expert supervision
+#                     self.idx_to_traj_step.append((traj_idx, step_idx))
+#         assert len(self.idx_to_traj_step) == self.supervision_steps, "Mismatch in supervision steps count"
+
+
+#     def __len__(self):
+#         # return len(self.trajectories) if not self.sample_steps else self.total_steps
+#         return self.supervision_steps
+
+#     def __getitem__(self, idx):
+#         traj_idx, step_idx = self.idx_to_traj_step[idx]
+#         traj = self.trajectories[traj_idx]
+#         observations = np.array(traj['observations'])[:step_idx+1]
+#         actions = np.array(traj['actions'])[:step_idx+1]
+#         rewards = np.array(traj['rewards'])[:step_idx+1]
+#         dones = np.array(traj['dones'])[:step_idx+1]
+#         expert_mask = np.zeros(step_idx+1, dtype=np.float32)
+#         expert_mask[step_idx] = 1.0
+#         # breakpoint()
+#         return {
+#             # observations: (T, H, W, C) float32
+#             "observations": torch.tensor(observations, dtype=torch.float32),
+#             # actions: (T,) long  – discrete action ids 0..3
+#             "actions": torch.tensor(actions, dtype=torch.long),
+#             # rewards: (T,)
+#             "rewards": torch.tensor(rewards, dtype=torch.float32),
+#             # dones: (T,)
+#             "dones": torch.tensor(dones, dtype=torch.float32),
+#             "expert_mask": torch.tensor(
+#                 expert_mask, dtype=torch.float32),
+#         }
+
+
+def split_trajectories(trajectories, train_ratio=0.8, seed=42):
+    """Split trajectories into train/val lists with deterministic shuffling."""
+    n = len(trajectories)
+    if n == 0:
+        return [], []
+    if n == 1:
+        return trajectories, []
+
+    rng = np.random.default_rng(seed)
+    indices = np.arange(n)
+    rng.shuffle(indices)
+
+    n_train = int(n * train_ratio)
+    n_train = max(1, min(n_train, n - 1))
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:]
+
+    train_trajs = [trajectories[i] for i in train_idx]
+    val_trajs = [trajectories[i] for i in val_idx]
+    return train_trajs, val_trajs
 
 class CustomWeightedRandomSampler(torch.utils.data.WeightedRandomSampler):
     """
@@ -239,7 +327,7 @@ def get_procgen_dataset(env, n_trajs, eval_policy, exploration_steps_range,
 
     exploration_steps = np.random.randint(min_exploration_steps, max_exploration_steps + 1, size=env.n)
     current_exploration_steps = np.zeros(env.n, dtype=int)
-    
+    pbar = tqdm.tqdm(total=n_trajs, desc="Collecting trajectories", unit="traj")
 
     while len(all_trajs) < n_trajs:
         # pick actions
@@ -256,7 +344,10 @@ def get_procgen_dataset(env, n_trajs, eval_policy, exploration_steps_range,
             else:
                 acts[i] = policy_action[i]
 
+        # prev_obs = obs
         next_obs, rews, dones, next_infos = env.step(acts)
+        if eval_policy is not None:
+            eval_policy.update_context(obs, acts, rews, dones)
 
         for i in range(env.n):
             save_vid = len(all_trajs) + i < n_video_trajs
@@ -267,17 +358,20 @@ def get_procgen_dataset(env, n_trajs, eval_policy, exploration_steps_range,
             # trajs[i]['expert_actions'].append(int(expert_acts[i]))
             trajs[i]['expert_mask'].append(bool(use_expert[i]))
             trajs[i]['_full_obs'].append(
-                infos[i].get('full_obs') if save_vid else None)
-            trajs[i]['_rgb'].append(
-                infos[i].get('rgb') if save_vid else None)
+                infos[i].get('full_obs'))
+            # trajs[i]['_rgb'].append(
+            #     infos[i].get('rgb') if save_vid else None)
             trajs[i]['_opt_grid'].append(
                 infos[i].get('opt_grid') if save_vid else None)
 
             if dones[i]:
                 traj_return = sum(trajs[i]['rewards'])
                 save_flag = traj_return > 0 and current_exploration_steps[i] >= min_exploration_steps and len(trajs[i]['actions']) > 2
+                # make sure that expert actions are atleast 5% of the trajectory
+                save_flag = save_flag and np.mean(trajs[i]['expert_mask']) >= 0.05
                 if save_flag:  # only keep successful trajectories
                     all_trajs.append(trajs[i])
+                    pbar.update(1)
                 trajs[i] = _new()
                 # is_expert[i] = False
                 current_exploration_steps[i] = 0
@@ -298,7 +392,7 @@ def get_procgen_dataset(env, n_trajs, eval_policy, exploration_steps_range,
     #         all_trajs.append(trajs[i])
 
     all_trajs = all_trajs[:n_trajs]
-    dataset = TrajectoryDataset(all_trajs)
+    dataset = TrajectoryDataset(all_trajs, sample_steps=False)
     return all_trajs, dataset
 
 
@@ -306,7 +400,7 @@ ACT_NAMES = ["UP", "DOWN", "LEFT", "RIGHT"]
 
 
 def save_dataset_videos(trajs, save_dir, dagger_step, visibility=None,
-                        n_videos=100, panel_size=256):
+                        n_videos=5, panel_size=256):
     """Save annotated videos showing only the observation for each timestep.
 
     Each frame is the rendered binary obs (or raw RGB if no visibility),
@@ -328,14 +422,15 @@ def save_dataset_videos(trajs, save_dir, dagger_step, visibility=None,
         combined = []
         cum_ret = 0.0
         for t in range(T):
-            obs_t = traj['observations'][t]
+            # obs_t = traj['observations'][t]
+            obs_t = traj['_full_obs'][t]
 
             # render obs as RGB image
-            if visibility is not None:
-                img = _render_grid_obs(obs_t)  # (wd*40, wd*40, 3) uint8
-            else:
-                img = obs_t.astype(np.uint8) if obs_t.dtype != np.uint8 \
-                    else obs_t
+            # if visibility is not None:
+            img = _render_grid_obs(obs_t)  # (wd*40, wd*40, 3) uint8
+            # else:
+            #     img = obs_t.astype(np.uint8) if obs_t.dtype != np.uint8 \
+            #         else obs_t
 
             # resize to panel_size
             img = np.array(Image.fromarray(img).resize(
@@ -366,15 +461,15 @@ def save_dataset_videos(trajs, save_dir, dagger_step, visibility=None,
         for frame in combined:
             writer.send(frame.tobytes())
         writer.close()
-        print(f"saved {vid_path} ({T} frames)")
+        # print(f"saved {vid_path} ({T} frames)")
 
         if wandb.run is not None:
             wandb.log({
-                f"Dataset-Step{dagger_step}/traj_{count}":
+                f"step{dagger_step}_dataset/video_traj_{count}_video":
                     wandb.Video(vid_path, format="mp4")
             })
         count += 1
-    print(f"Saved {count} dataset trajectory videos to {save_dir}")
+    # print(f"Saved {count} dataset trajectory videos to {save_dir}")
 
 
 def get_optimizer_scheduler(model, total_steps, lr, warmup_ratio):
@@ -401,6 +496,7 @@ def train_step(
     optimizer,
     scheduler,
     train_loader,
+    val_loaders_by_step,
     save_dir,
     args,
     device,
@@ -416,7 +512,7 @@ def train_step(
         optimizer: Optimizer
         scheduler: Learning rate scheduler
         train_loader: Training data loader
-        test_loader: Test data loader
+        val_loaders_by_step: List[(source_step_id, val_loader)]
         save_dir: Directory to save checkpoints
         args: Training arguments
         device: Device to train on
@@ -435,15 +531,13 @@ def train_step(
     def forward(batch):
         """Compute cross-entropy loss for discrete actions."""
         batch = {k: v.to(device) for k, v in batch.items()}
-
+        # breakpoint()
         # Model expects dict with 'states', 'actions', 'rewards', 'dones'
         # states: (B, T, H, W, C), actions: one-hot (B, T, A)
         B, T = batch['observations'].shape[:2]
-        one_hot_actions = F.one_hot(
-            batch['actions'], action_dim).float()  # (B, T, A)
         model_input = {
             'states': batch['observations'],   # (B, T, H, W, C)
-            'actions': one_hot_actions,         # (B, T, A)
+            'actions': batch['actions'],         # (B, T, A)
             'rewards': batch['rewards'],        # (B, T)
             'dones': batch['dones'],            # (B, T)
         }
@@ -455,7 +549,6 @@ def train_step(
 
         # Mask: only count loss where attention_mask AND expert_mask are 1
         loss_mask = batch['attention_mask'] * batch['expert_mask']  # (B, T)
-
         # Per-token cross entropy
         action_loss = F.cross_entropy(
             pred_logits.reshape(-1, action_dim),
@@ -471,67 +564,87 @@ def train_step(
 
         return loss, {"loss": loss.item()}
     
-    for epoch in tqdm.tqdm(range(args.num_epochs), desc=f"Training DAgger Step {step_id}"):
-        # Evaluation
-        # if epoch % eval_freq == 0 or epoch == args.num_epochs - 1:
-        #     model.eval()
-        #     eval_stats = defaultdict(list)
-            
-        #     with torch.no_grad():
-        #         for batch in test_loader:
-        #             loss, stats = forward(batch)
-        #             for k, v in stats.items():
-        #                 eval_stats[k].append(v)
-            
-        #     for k, v in eval_stats.items():
-        #         eval_stats[k] = np.mean(v)
-            
-        #     if args.log_wandb:
-        #         for k, v in eval_stats.items():
-        #             wandb.log({f"dagger-{step_id}/test_{k}": v})
-            
-        #     print(f"Epoch {epoch} - Test Loss: {eval_stats['loss']:.4f}")
-
-        # Training
+    for epoch in tqdm.tqdm(range(args.num_epochs),
+                           desc=f"Training DAgger Step {step_id}"):
         model.train()
         train_stats = defaultdict(list)
-        
+        grad_norms = []
+
         for batch in train_loader:
             loss, stats = forward(batch)
-            
+
             optimizer.zero_grad()
             loss.backward()
-            
-            # Compute gradient norm
+
             if args.log_wandb:
                 total_norm = 0.0
                 for p in model.parameters():
                     if p.grad is not None:
                         param_norm = p.grad.data.norm(2)
                         total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                wandb.log({
-                    f"dagger-{step_id}/grad_norm": total_norm,
-                    f"dagger-{step_id}/lr": optimizer.param_groups[0]['lr']
-                })
-            
-            # Clip gradients
+                grad_norms.append(total_norm ** 0.5)
+
             if args.gradient_clip:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
+
             optimizer.step()
             scheduler.step()
-            
+
             for k, v in stats.items():
                 train_stats[k].append(v)
-        
-        if args.log_wandb:
-            for k, v in train_stats.items():
-                wandb.log({f"dagger-{step_id}/{k}": np.mean(v)})
 
-        # Save checkpoint
+        if args.log_wandb:
+            train_payload = {
+                f"step{step_id}/train_{k}": float(np.mean(v))
+                for k, v in train_stats.items()
+            }
+            train_payload[f"step{step_id}/train_lr"] = \
+                float(optimizer.param_groups[0]['lr'])
+            if len(grad_norms) > 0:
+                train_payload[f"step{step_id}/train_grad_norm"] = \
+                    float(np.mean(grad_norms))
+            train_payload["dagger_step"] = step_id
+            train_payload["epoch"] = epoch
+            wandb.log(train_payload)
+
+        if len(val_loaders_by_step) > 0 and \
+                (epoch % eval_freq == 0 or epoch == args.num_epochs - 1):
+            model.eval()
+            val_losses = {}
+            with torch.no_grad():
+                for source_step, val_loader in val_loaders_by_step:
+                    source_stats = defaultdict(list)
+                    for batch in val_loader:
+                        _, stats = forward(batch)
+                        for k, v in stats.items():
+                            source_stats[k].append(v)
+                    if len(source_stats["loss"]) > 0:
+                        val_losses[source_step] = \
+                            float(np.mean(source_stats["loss"]))
+
+            if args.log_wandb and len(val_losses) > 0:
+                val_payload = {
+                    f"step{step_id}/val_source_step_{src}_loss": v
+                    for src, v in val_losses.items()
+                }
+                val_payload[f"step{step_id}/val_mean_loss"] = \
+                    float(np.mean(list(val_losses.values())))
+                val_payload["dagger_step"] = step_id
+                val_payload["epoch"] = epoch
+                wandb.log(val_payload)
+
+            # if len(val_losses) > 0:
+            #     loss_msg = ", ".join(
+            #         [f"s{src}: {loss:.4f}"
+            #          for src, loss in sorted(val_losses.items())]
+            #     )
+                # print(f"Epoch {epoch} - Val loss by source step: {loss_msg}")
+
         if epoch % save_freq == 0:
-            torch.save(model.state_dict(), os.path.join(step_save_dir, f"model_epoch_{epoch}.pth"))
+            torch.save(
+                model.state_dict(),
+                os.path.join(step_save_dir, f"model_epoch_{epoch}.pth"),
+            )
 
     return model
 # def data_step(save_dir, step_id, train_envs, test_envs, rollout_policy, horizon,
@@ -603,16 +716,20 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_size", type=int, default=1000)
     parser.add_argument("--dagger_steps", type=int, default=100)
     parser.add_argument("--n_train_envs", type=int, default=16)
-    parser.add_argument("--n_eval_envs", type=int, default=20)
+    parser.add_argument("--n_eval_envs", type=int, default=100)
     parser.add_argument("--visibility", type=int, default=7,
                         help="Partial-obs window size (e.g. 7). "
                              "None/0 = full 64x64 RGB obs.")
+    parser.add_argument("--fixed_maze", action="store_true",
+                        help="Use single maze (seed 42), only randomize goals.")
+    parser.add_argument("--train_goal_ratio", type=float, default=0.8,
+                        help="Fraction of free cells for train goals (80/20).")
 
     # Model
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--n_embd", type=int, default=256)
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.1)
 
     # Training
     parser.add_argument("--batch_size", type=int, default=64)
@@ -673,6 +790,8 @@ if __name__ == "__main__":
         eval_start=1000,
         eval_levels=args.n_eval_envs,
         visibility=vis,
+        fixed_maze=args.fixed_maze,
+        train_goal_ratio=args.train_goal_ratio,
     )
     obs_shape = tuple(train_env.observation_space.shape)  # (H, W, C)
     action_dim = train_env.action_space.n  # 4
@@ -719,13 +838,26 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # eval_policy = None  # None means pure expert on first step
     training_datasets = []
+    validation_datasets = []
 
+    # exploration_steps_curriculum = [
+    #     (0, 0),
+    #     (5, 20),
+    #     (20, 40),
+    #     (40, 60),
+    #     (60, 100)
+    # ]
     exploration_steps_curriculum = [
+        # (0, 0),
+        # (10, 30),
+        # (20, 60),
+        # (40, 120),
+        # (80, 200)
         (0, 0),
-        (5, 20),
-        (20, 50),
+        (25, 50),
         (50, 100),
-        (100, 200)
+        (100, 200),
+        (200, 400)
     ]
 
     sampling_ratio_curriculum = [
@@ -757,27 +889,59 @@ if __name__ == "__main__":
         data_collection_policy = TransformerCNNPolicy(
             model=model,
             context_horizon=model_horizon,
-            temp=0.1
+            temp=1.0
         )
-        all_trajs, current_train_dataset = get_procgen_dataset(
+        all_trajs, _ = get_procgen_dataset(
             train_env,
             n_trajs=args.dataset_size,
             eval_policy=data_collection_policy,
             # expert_p=expert_p,
             exploration_steps_range=exploration_steps_curriculum[step_idx]
         )
+        current_train_trajs, current_val_trajs = split_trajectories(
+            all_trajs, train_ratio=0.8, seed=args.seed + step_idx
+        )
+        current_train_dataset = TrajectoryDataset(
+            current_train_trajs, sample_steps=False
+        )
+        current_val_dataset = TrajectoryDataset(
+            current_val_trajs, sample_steps=False
+        )
         training_datasets.append(current_train_dataset)
-        print(f"Collected {len(current_train_dataset)} trajectories")
+        validation_datasets.append(current_val_dataset)
+        print(f"Collected {len(all_trajs)} trajectories")
+        print(f"Split -> train: {len(current_train_dataset)}, "
+              f"val: {len(current_val_dataset)}")
 
         sampling_ratio = sampling_ratio_curriculum[step_idx]
         print(f"Sampling ratio for training: {sampling_ratio}")
+
+        if args.log_wandb:
+            dataset_stats = {
+                f"step{step_idx}_dataset/current_total_trajs":
+                    len(all_trajs),
+                f"step{step_idx}_dataset/current_train_trajs":
+                    len(current_train_dataset),
+                f"step{step_idx}_dataset/current_val_trajs":
+                    len(current_val_dataset),
+                f"step{step_idx}_dataset/combined_train_trajs":
+                    int(sum(len(d) for d in training_datasets)),
+                f"step{step_idx}_dataset/combined_val_trajs":
+                    int(sum(len(d) for d in validation_datasets)),
+                "dagger_step": step_idx,
+            }
+            for source_step, val_ds in enumerate(validation_datasets):
+                dataset_stats[
+                    f"step{step_idx}_dataset/val_source_step_{source_step}_trajs"
+                ] = len(val_ds)
+            wandb.log(dataset_stats)
 
         # 1b. Log a few annotated dataset trajectory videos
         data_vid_dir = os.path.join(
             save_dir, f"dagger_step_{step_idx}", "dataset_videos")
         save_dataset_videos(
             all_trajs, data_vid_dir, step_idx,
-            visibility=vis, n_videos=50,
+            visibility=vis, n_videos=5,
         )
 
         train_dataset = MultiTrajectoryDataset(training_datasets, sampling_ratio)
@@ -789,6 +953,17 @@ if __name__ == "__main__":
             collate_fn=collate_fn_procgen,
             sampler=weighted_sampler
         )
+        val_loaders_by_step = []
+        for source_step, val_dataset in enumerate(validation_datasets):
+            if len(val_dataset) == 0:
+                continue
+            val_loader = torch.utils.data.DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=collate_fn_procgen,
+            )
+            val_loaders_by_step.append((source_step, val_loader))
 
         # 2. Train
         total_steps = (len(train_dataset.weights) * args.num_epochs) // args.batch_size
@@ -796,7 +971,8 @@ if __name__ == "__main__":
 
         model = train_step(
             step_idx, model, optimizer, scheduler,
-            train_loader, save_dir, args, device,
+            train_loader, val_loaders_by_step,
+            save_dir, args, device,
             action_dim, env_horizon,
         )
 
@@ -805,34 +981,68 @@ if __name__ == "__main__":
         eval_policy = TransformerCNNPolicy(
             model=model,
             context_horizon=model_horizon,
-            temp=0.1
+            temp=1.0
         )
         # eval_policy_adapter = _PolicyAdapter(transformer_policy)
 
         # 4. Evaluate
         eval_save_dir = os.path.join(
             save_dir, f"dagger_step_{step_idx}", "eval")
-        mean_ret, std_ret = evaluate_policy_on_envs_procgen(
-            # eval_envs=eval_env,
-            eval_envs=train_env,  # evaluate on training envs to see improvement across steps
+        mean_ret, std_ret, success_rate = evaluate_policy_on_envs_procgen(
+            eval_envs=eval_env,
+            # eval_envs=train_env,  # evaluate on training envs to see improvement across steps
             policy=eval_policy,
             eval_horizon=env_horizon,
             save_dir=eval_save_dir,
             dagger_step=step_idx,
+            eval_name="temp_1.0",
         )
 
         print(f"Eval return: {mean_ret:.2f} ± {std_ret:.2f}")
 
+        ## Low temp eval
+        eval_policy_low_temp = TransformerCNNPolicy(
+            model=model,
+            context_horizon=model_horizon,
+            temp=0.1
+        )
+        mean_ret_low, std_ret_low, success_rate_low = evaluate_policy_on_envs_procgen(
+            eval_envs=eval_env,
+            policy=eval_policy_low_temp,
+            eval_horizon=env_horizon,
+            save_dir=os.path.join(eval_save_dir, "low_temp"),
+            dagger_step=step_idx,
+            eval_name="temp_0.1",
+        )
+        print(f"Low-temp eval return: {mean_ret_low:.2f} ± {std_ret_low:.2f}")
+
         if args.log_wandb:
-            wandb.log({
+            eval_payload = {
                 "dagger_step": step_idx,
-                "eval/mean_return": mean_ret,
-                "eval/std_return": std_ret,
-                # "expert_p": expert_p,
-                "exploration_steps_range": exploration_steps_curriculum[step_idx],
-                "sampling_ratio": sampling_ratio,
-                "learning_rate": lr_curriculum[step_idx],
-            })
+                "eval/temp_1.0_mean_return":
+                    mean_ret,
+                "eval/temp_1.0_std_return":
+                    std_ret,
+                "eval/temp_1.0_success_rate":
+                    success_rate,
+                "eval/temp_0.1_mean_return":
+                    mean_ret_low,
+                "eval/temp_0.1_std_return":
+                    std_ret_low,
+                "eval/temp_0.1_success_rate":
+                    success_rate_low,
+                # f"eval/curriculum_exploration_min":
+                #     exploration_steps_curriculum[step_idx][0],
+                # f"step{step_idx}_eval/curriculum_exploration_max":
+                #     exploration_steps_curriculum[step_idx][1],
+                # f"step{step_idx}_eval/curriculum_learning_rate":
+                #     lr_curriculum[step_idx],
+            }
+            for ratio_idx, ratio_val in enumerate(sampling_ratio):
+                eval_payload[
+                    f"eval/curriculum_sampling_ratio_{ratio_idx}"
+                ] = ratio_val
+            wandb.log(eval_payload)
 
         # 5. Decay expert probability
         # expert_p = max(min_expert_p, expert_p - expert_p_decay)
