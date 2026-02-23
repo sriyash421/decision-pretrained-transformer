@@ -38,3 +38,11 @@ Note: this is not an official Google or Facebook product.
 ## License
 
 MIT
+
+
+## Cmds
+
+- Launch training
+```
+python train_context_accumulator.py --dagger_steps 5 --dataset_size 2000 --log_wandb --num_epochs 100 --visibility 3 --batch_size 64 --fixed_maze
+```

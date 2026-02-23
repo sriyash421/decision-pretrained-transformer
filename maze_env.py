@@ -20,7 +20,12 @@ def _render_grid_obs(obs_3ch, cell_px=40):
         for gx in range(wd):
             py = gy * cell_px
             px = gx * cell_px
-            ch0, ch1, ch2 = obs_3ch[gy, gx]
+            ch0 = obs_3ch[gy, gx, 0]
+            ch1 = obs_3ch[gy, gx, 1]
+            if obs_3ch.shape[2] < 3:
+                ch2 = 0.0
+            else:
+                ch2 = obs_3ch[gy, gx, 2]
             if ch0 < -0.5:
                 img[py:py + cell_px, px:px + cell_px] = 120
             elif ch0 > 0.5:
@@ -76,10 +81,10 @@ def load_maze_and_goals(maze_path, train_ratio=0.8, seed=42):
     wd = nav.shape[0]
     free = [(x, y) for y in range(wd) for x in range(wd) if nav[y, x]]
     np.random.seed(seed)
-    # idxs = np.random.permutation(len(free))
-    # n_train = int(len(free) * train_ratio)
-    # train_goals = [free[i] for i in idxs[:n_train]]
-    # eval_goals = [free[i] for i in idxs[n_train:]]
+    idxs = np.random.permutation(len(free))
+    n_train = int(len(free) * train_ratio)
+    train_goals = [free[i] for i in idxs[:n_train]]
+    eval_goals = [free[i] for i in idxs[n_train:]]
     train_goals = free
     eval_goals = free
     return nav, train_goals, eval_goals
@@ -96,7 +101,7 @@ class MazeEnv:
                            for x in range(self.wd) if nav[y, x]]
 
         self.observation_space = spaces.Box(
-            -1, 1, (self.visibility, self.visibility, 3), np.float32)
+            -1, 1, (self.visibility, self.visibility, 2), np.float32)
         self.action_space = spaces.Discrete(N_ACT)
 
         self.agent_pos = None
@@ -126,7 +131,7 @@ class MazeEnv:
 
     def _obs(self):
         v = self.visibility
-        obs = np.full((v, v, 3), -1.0, dtype=np.float32)
+        obs = np.full((v, v, 2), -1.0, dtype=np.float32)
         ax, ay = self.agent_pos
         gx, gy = self.goal_pos
 
@@ -145,7 +150,7 @@ class MazeEnv:
                 if 0 <= wx < self.wd and 0 <= wy < self.wd:
                     obs[oy, ox, 0] = 0.0 if self.nav[wy, wx] else 1.0
                     obs[oy, ox, 1] = 1.0 if (wx == gx and wy == gy) else 0.0
-                    obs[oy, ox, 2] = 1.0 if (wx == ax and wy == ay) else 0.0
+                    # obs[oy, ox, 2] = 1.0 if (wx == ax and wy == ay) else 0.0
         # obs = _render_grid_obs(obs, cell_px=40)  # (v*40, v*40, 3) uint8
         return obs
 
@@ -203,7 +208,7 @@ def make_maze_envs(
     visibility=7,
     train_goal_ratio=0.8,
     seed=42,
-    maze_path="maze.npy",
+    maze_path="maze_grids/maze.npy",
     max_steps=500,
     **kwargs,
 ):

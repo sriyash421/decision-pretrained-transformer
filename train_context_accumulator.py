@@ -60,6 +60,7 @@ def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
     done_flag = np.zeros(n, dtype=bool)
     episode_rewards = np.zeros(n, dtype=np.float32)
     successes = np.zeros(n, dtype=bool)
+    episode_lengths = np.zeros(n, dtype=int)
     # each frame is (partial_rgb, full_rgb) – both uint8
     episode_frames = [[] for _ in range(n)]
 
@@ -87,6 +88,7 @@ def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
         policy.update_context(obs, actions, rewards, dones)
         policy.reset(dones)
         obs = next_obs
+        episode_lengths[~done_flag] += 1
 
         for i in range(n):
             if not done_flag[i]:
@@ -119,14 +121,23 @@ def evaluate_policy_on_envs_procgen(eval_envs, policy, eval_horizon,
 
         if wandb.run is not None:
             wandb.log({
-                f"step{dagger_step}_eval/video_{eval_name}_episode_{i}_video":
+                f"step{dagger_step}_eval/video_{eval_name}_episode_{i}_video_{'success' if successes[i] else 'failure'}":
                     wandb.Video(vid_path, format="mp4")
             })
 
     mean_ret = float(np.mean(episode_rewards))
     std_ret = float(np.std(episode_rewards))
     success_rate = float(np.mean(successes))
-    return mean_ret, std_ret, success_rate
+    mean_length = float(np.mean(episode_lengths))
+    mean_success_length = float(np.mean(episode_lengths[successes])) if successes.any() else 0.0
+    stats = {
+        "mean_return": mean_ret,
+        "std_return": std_ret,
+        "success_rate": success_rate,
+        "mean_length": mean_length,
+        "mean_success_length": mean_success_length
+    }
+    return stats
 
 # ---------------------------------------------------------------------------
 #  Dataset
@@ -367,8 +378,8 @@ def get_procgen_dataset(env, n_trajs, eval_policy, exploration_steps_range,
             if dones[i]:
                 traj_return = sum(trajs[i]['rewards'])
                 save_flag = traj_return > 0 and current_exploration_steps[i] >= min_exploration_steps and len(trajs[i]['actions']) > 2
-                # make sure that expert actions are atleast 5% of the trajectory
-                save_flag = save_flag and np.mean(trajs[i]['expert_mask']) >= 0.05
+                # make sure that expert actions are atleast 1% of the trajectory
+                save_flag = save_flag and np.mean(trajs[i]['expert_mask']) >= 0.01
                 if save_flag:  # only keep successful trajectories
                     all_trajs.append(trajs[i])
                     pbar.update(1)
@@ -795,7 +806,8 @@ if __name__ == "__main__":
     )
     obs_shape = tuple(train_env.observation_space.shape)  # (H, W, C)
     action_dim = train_env.action_space.n  # 4
-    env_horizon = 500  # procgen maze max episode steps (easy mode)
+    # env_horizon = 500  # procgen maze max episode steps (easy mode)
+    env_horizon = 600  # procgen maze max episode steps (easy mode)
     print(f"Obs shape: {obs_shape}, Action dim: {action_dim}, "
           f"Env horizon: {env_horizon}")
 
@@ -857,22 +869,49 @@ if __name__ == "__main__":
         (25, 50),
         (50, 100),
         (100, 200),
-        (200, 400)
+        (200, 350),
+        (350, 500),
+        (400, 600)
     ]
+    # create a curriculum that starts with 0-0 exploration steps, and then proceeds based on exploration steps
+    # curriculum_start = 0
+    # curriculum_end = env_horizon
+    # delta = int((curriculum_end // args.dagger_steps))
+    # exploration_steps_curriculum = [(0,0)]
+    # sampling_ratio_curriculum = [(1.0,)]
+    # for step_idx in range(1, args.dagger_steps):
+    #     exploration_steps_curriculum.append((curriculum_start, curriculum_start + delta))
+    #     curriculum_start += delta
+    #     sampling_ratio = np.arange(step_idx + 1)+1
+    #     sampling_ratio = sampling_ratio / sampling_ratio.sum()
+    #     sampling_ratio_curriculum.append(tuple(sampling_ratio))
+    #     # delta = int(curriculum_end * (step_idx + 1) / args.dagger_steps) - curriculum_start
+    # lr_curriculum = [1e-5] * args.dagger_steps
+    # lr_curriculum[0] = 1e-4  # start with higher lr for first step
+    # print(f"Exploration steps curriculum: {exploration_steps_curriculum}")
+    # print(f"Sampling ratio curriculum: {sampling_ratio_curriculum}")
+    # print(f"Learning rate curriculum: {lr_curriculum}")
 
+    # sampling_ratio_curriculum = [
+    #     (1.0, ),
+    #     (0.25, 0.75),
+    #     (0.2, 0.3, 0.5),
+    #     (0.1, 0.2, 0.3, 0.4),
+    #     (0.05, 0.15, 0.25, 0.35, 0.4)
+    # ]
     sampling_ratio_curriculum = [
         (1.0, ),
-        (0.25, 0.75),
-        (0.2, 0.3, 0.5),
-        (0.1, 0.2, 0.3, 0.4),
-        (0.05, 0.15, 0.25, 0.35, 0.4)
+        (0.5, 0.5),
+        (0.33, 0.33, 0.34),
+        (0.25, 0.25, 0.25, 0.25),
+        (0.2, 0.2, 0.2, 0.2, 0.2)
     ]
     lr_curriculum = [
         1e-4,
-        1e-5,
-        1e-5,
-        1e-5,
-        1e-5,
+        1e-4,
+        1e-4,
+        1e-4,
+        1e-4,
     ]
     for step_idx in range(args.dagger_steps):
         print(f"\n{'=' * 60}")
@@ -966,6 +1005,7 @@ if __name__ == "__main__":
             val_loaders_by_step.append((source_step, val_loader))
 
         # 2. Train
+        model = DecisionTransformerCnn(model_args).to(device)
         total_steps = (len(train_dataset.weights) * args.num_epochs) // args.batch_size
         optimizer, scheduler = get_optimizer_scheduler(model, total_steps, lr_curriculum[step_idx], args.warmup_ratio)
 
@@ -988,7 +1028,7 @@ if __name__ == "__main__":
         # 4. Evaluate
         eval_save_dir = os.path.join(
             save_dir, f"dagger_step_{step_idx}", "eval")
-        mean_ret, std_ret, success_rate = evaluate_policy_on_envs_procgen(
+        eval_stats = evaluate_policy_on_envs_procgen(
             eval_envs=eval_env,
             # eval_envs=train_env,  # evaluate on training envs to see improvement across steps
             policy=eval_policy,
@@ -998,7 +1038,7 @@ if __name__ == "__main__":
             eval_name="temp_1.0",
         )
 
-        print(f"Eval return: {mean_ret:.2f} ± {std_ret:.2f}")
+        # print(f"Eval return: {mean_ret:.2f} ± {std_ret:.2f}")
 
         ## Low temp eval
         eval_policy_low_temp = TransformerCNNPolicy(
@@ -1006,7 +1046,7 @@ if __name__ == "__main__":
             context_horizon=model_horizon,
             temp=0.1
         )
-        mean_ret_low, std_ret_low, success_rate_low = evaluate_policy_on_envs_procgen(
+        eval_low_temp_stats = evaluate_policy_on_envs_procgen(
             eval_envs=eval_env,
             policy=eval_policy_low_temp,
             eval_horizon=env_horizon,
@@ -1014,30 +1054,37 @@ if __name__ == "__main__":
             dagger_step=step_idx,
             eval_name="temp_0.1",
         )
-        print(f"Low-temp eval return: {mean_ret_low:.2f} ± {std_ret_low:.2f}")
+        # print(f"Low-temp eval return: {mean_ret_low:.2f} ± {std_ret_low:.2f}")
 
         if args.log_wandb:
-            eval_payload = {
-                "dagger_step": step_idx,
-                "eval/temp_1.0_mean_return":
-                    mean_ret,
-                "eval/temp_1.0_std_return":
-                    std_ret,
-                "eval/temp_1.0_success_rate":
-                    success_rate,
-                "eval/temp_0.1_mean_return":
-                    mean_ret_low,
-                "eval/temp_0.1_std_return":
-                    std_ret_low,
-                "eval/temp_0.1_success_rate":
-                    success_rate_low,
-                # f"eval/curriculum_exploration_min":
-                #     exploration_steps_curriculum[step_idx][0],
-                # f"step{step_idx}_eval/curriculum_exploration_max":
-                #     exploration_steps_curriculum[step_idx][1],
-                # f"step{step_idx}_eval/curriculum_learning_rate":
-                #     lr_curriculum[step_idx],
-            }
+            eval_payload = {"dagger_step": step_idx}
+            eval_payload.update({
+                f"eval/{eval_name}_{metric}": value
+                for eval_name, stats in [("temp_1.0", eval_stats),
+                                         ("temp_0.1", eval_low_temp_stats)]
+                for metric, value in stats.items()
+            })
+            # eval_payload = {
+            #     "dagger_step": step_idx,
+            #     "eval/temp_1.0_mean_return":
+            #         mean_ret,
+            #     "eval/temp_1.0_std_return":
+            #         std_ret,
+            #     "eval/temp_1.0_success_rate":
+            #         success_rate,
+            #     "eval/temp_0.1_mean_return":
+            #         mean_ret_low,
+            #     "eval/temp_0.1_std_return":
+            #         std_ret_low,
+            #     "eval/temp_0.1_success_rate":
+            #         success_rate_low,
+            #     # f"eval/curriculum_exploration_min":
+            #     #     exploration_steps_curriculum[step_idx][0],
+            #     # f"step{step_idx}_eval/curriculum_exploration_max":
+            #     #     exploration_steps_curriculum[step_idx][1],
+            #     # f"step{step_idx}_eval/curriculum_learning_rate":
+            #     #     lr_curriculum[step_idx],
+            # }
             for ratio_idx, ratio_val in enumerate(sampling_ratio):
                 eval_payload[
                     f"eval/curriculum_sampling_ratio_{ratio_idx}"
