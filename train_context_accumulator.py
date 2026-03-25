@@ -29,7 +29,7 @@ from PIL import Image
 
 from get_rollout_policy import TransformerCNNPolicy
 from models import DecisionTransformerCnn
-from maze_env import make_maze_envs, _render_grid_obs
+from procgen_env import make_maze_envs, _render_grid_obs
 
 
 # ---------------------------------------------------------------------------
@@ -731,10 +731,14 @@ if __name__ == "__main__":
     parser.add_argument("--visibility", type=int, default=7,
                         help="Partial-obs window size (e.g. 7). "
                              "None/0 = full 64x64 RGB obs.")
-    parser.add_argument("--fixed_maze", action="store_true",
-                        help="Use single maze (seed 42), only randomize goals.")
-    parser.add_argument("--train_goal_ratio", type=float, default=0.8,
-                        help="Fraction of free cells for train goals (80/20).")
+    parser.add_argument("--train_start_level", type=int, default=0,
+                        help="First procgen level seed for training envs.")
+    parser.add_argument("--train_num_levels", type=int, default=1000,
+                        help="Number of procgen levels available to training envs.")
+    parser.add_argument("--eval_start_level", type=int, default=1000,
+                        help="First procgen level seed for eval envs.")
+    parser.add_argument("--eval_num_levels", type=int, default=1000,
+                        help="Number of procgen levels available to eval envs.")
 
     # Model
     parser.add_argument("--num_layers", type=int, default=4)
@@ -796,13 +800,11 @@ if __name__ == "__main__":
     train_env, eval_env = make_maze_envs(
         n_train=args.n_train_envs,
         n_eval=args.n_eval_envs,
-        train_start=0,
-        train_levels=1000,
-        eval_start=1000,
-        eval_levels=args.n_eval_envs,
+        train_start=args.train_start_level,
+        train_levels=args.train_num_levels,
+        eval_start=args.eval_start_level,
+        eval_levels=args.eval_num_levels,
         visibility=vis,
-        fixed_maze=args.fixed_maze,
-        train_goal_ratio=args.train_goal_ratio,
     )
     obs_shape = tuple(train_env.observation_space.shape)  # (H, W, C)
     action_dim = train_env.action_space.n  # 4

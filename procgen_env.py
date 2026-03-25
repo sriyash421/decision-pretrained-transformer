@@ -579,16 +579,27 @@ def make_maze_envs(
         If True, use a single maze (seed 42) and only randomize start/goal.
     train_goal_ratio : float
         Fraction of free cells to use as train goals (rest for eval).
+
+    Notes
+    -----
+    With ``fixed_maze=False`` (default), train/eval generalization split is
+    internal to Procgen and controlled by ``train_start/train_levels`` and
+    ``eval_start/eval_levels``. No explicit goal split is used in that mode.
     """
     # build goal sets if fixed_maze
     train_goals, eval_goals = None, None
     if fixed_maze:
         free = _get_free_cells_seed42()
-        np.random.seed(42)
-        idxs = np.random.permutation(len(free))
+        rng = np.random.default_rng(42)
+        idxs = rng.permutation(len(free))
         n_train_goals = int(len(free) * train_goal_ratio)
         train_goals = [free[i] for i in idxs[:n_train_goals]]
         eval_goals = [free[i] for i in idxs[n_train_goals:]]
+        if len(train_goals) == 0 or len(eval_goals) == 0:
+            raise ValueError(
+                "fixed_maze=True requires non-empty train/eval goal sets; "
+                "adjust train_goal_ratio away from 0.0/1.0"
+            )
 
     train_g3 = lambda: ProcgenGym3Env(
         num=n_train,
