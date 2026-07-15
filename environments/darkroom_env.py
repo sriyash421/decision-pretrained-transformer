@@ -1,3 +1,5 @@
+"""Darkroom: sparse-reward 2D goal-search gridworld (single + vectorized)."""
+
 import gym
 import numpy as np
 

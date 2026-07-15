@@ -1,3 +1,5 @@
+"""Base class for the gridworld and navigation environments."""
+
 import gym
 import numpy as np
 

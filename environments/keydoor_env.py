@@ -1,3 +1,5 @@
+"""Key-Door gridworld: find a hidden key, then reach a hidden door (single + vectorized)."""
+
 import gym
 import numpy as np
 

@@ -1,3 +1,5 @@
+"""2D point-mass navigation to a hidden goal (single + vectorized)."""
+
 import gym
 import numpy as np
 

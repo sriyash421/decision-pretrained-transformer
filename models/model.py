@@ -1,3 +1,5 @@
+"""Model architectures: DPT Transformer, Decision Transformer (+ CNN variant), and the asymmetric critic."""
+
 import torch
 import torch.nn as nn
 import transformers
