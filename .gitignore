@@ -1,21 +1,22 @@
-datasets/
-figs/
-batches/
-backup/
-out/
-*.pt
-*.png
+# Python
+__pycache__/
 *.pyc
-*.pdf
-__pycache__
-*.pt
-*.pkl
-datasets*
-slurm_logs*
-wandb/
-*.sh
+*.egg-info/
+.venv/
+build/
+dist/
 
-archive
-results
-context_results
-models
+# All experiment outputs: checkpoints, evals, logs, plots, and archived code
+results/
+context_results/
+wandb/
+slurm_logs*/
+
+# Data & model artifacts (always written under results/)
+*.pkl
+*.pt
+*.npz
+*.png
+
+# Large paper PDF stays local
+*.pdf
