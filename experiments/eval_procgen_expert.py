@@ -6,7 +6,7 @@ import wandb
 import numpy as np
 
 from environments.procgen_env import make_maze_envs
-from train_context_accumulator import evaluate_policy_on_envs_procgen
+from experiments.train_asteroid_procgen import evaluate_policy_on_envs_procgen
 
 
 class ProcgenExpertPolicy:
@@ -56,8 +56,8 @@ def build_parser():
     parser.add_argument("--eval-num-levels", type=int, default=1000)
     parser.add_argument("--eval-horizon", type=int, default=800)
     parser.add_argument("--env-interactions", type=int, default=0)
-    parser.add_argument("--metrics-csv", type=str, default="expert_procgen_results/expert_seed0.csv")
-    parser.add_argument("--save-dir", type=str, default="expert_procgen_results/eval_videos")
+    parser.add_argument("--metrics-csv", type=str, default="results/expert_procgen/expert_seed0.csv")
+    parser.add_argument("--save-dir", type=str, default="results/expert_procgen/eval_videos")
     parser.add_argument("--log-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="asteroid-procgen")
     parser.add_argument("--wandb-entity", type=str, default=None)

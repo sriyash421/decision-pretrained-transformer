@@ -2,6 +2,7 @@
 
 from models.model import (
     DecisionTransformer,
+    DecisionTransformerCnn,
     Transformer,
     ImageTransformer,
     MLP,

@@ -25,8 +25,8 @@ baselines = [
     "sb3-contrib>=2.0",
     "gymnasium>=0.28",
 ]
-# Procgen maze benchmark.
-procgen = ["procgen"]
+# Procgen maze benchmark (eval videos + visitation-heatmap plotting).
+procgen = ["procgen", "gymnasium>=0.28", "imageio-ffmpeg", "seaborn"]
 
 [build-system]
 requires = ["hatchling"]

@@ -13,7 +13,7 @@ import torch
 from environments.rollout_policy import TransformerCNNPolicy
 from models import DecisionTransformerCnn
 from environments.procgen_env import make_maze_envs
-from train_procgen_rl2_bc import RecurrentBCPPOPolicy
+from experiments.train_procgen_bc_ppo import RecurrentBCPPOPolicy
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

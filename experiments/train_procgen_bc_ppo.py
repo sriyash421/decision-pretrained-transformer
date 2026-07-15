@@ -370,7 +370,7 @@ def build_parser():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--max_buffer_trajectories", type=int, default=10000)
-    parser.add_argument("--save_dir", type=str, default="./bc_ppo_procgen_results")
+    parser.add_argument("--save_dir", type=str, default="results/bc_ppo_procgen")
     parser.add_argument("--log_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="asteroid-procgen")
     parser.add_argument("--wandb_entity", type=str, default=None)
