@@ -6,6 +6,8 @@ The observation is augmented with (prev_reward, prev_done) to provide adaptation
 """
 
 import argparse
+
+from experiments.config import parse_with_config
 import os
 import pickle
 import random
@@ -147,7 +149,7 @@ if __name__ == "__main__":
     # Varibad
     parser.add_argument("--use_varibad", action="store_true")
     
-    args = parser.parse_args()
+    args = parse_with_config(parser)
 
     # Compute batch_size from n_minibatches if not specified
     if args.batch_size is None:

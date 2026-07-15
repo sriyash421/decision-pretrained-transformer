@@ -19,6 +19,8 @@ if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method("spawn", force=True)
 
 import argparse
+
+from experiments.config import parse_with_config
 import os
 import numpy as np
 import torch
@@ -552,7 +554,7 @@ if __name__ == "__main__":
     # Paths
     parser.add_argument("--save_dir", type=str, default="results/aawr")
 
-    args = parser.parse_args()
+    args = parse_with_config(parser)
 
     # Initialize wandb
     if args.log_wandb:
