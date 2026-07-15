@@ -1,7 +1,7 @@
 import gym
 import numpy as np
 
-from envs.base_env import BaseEnv
+from environments.base_env import BaseEnv
 
 
 class NavigationEnv(BaseEnv):

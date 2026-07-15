@@ -137,7 +137,7 @@ def get_dagger_dataset(train_envs, test_envs, rollout_policy, horizon):
     Returns:
         train_dataset, test_dataset: SequenceDataset instances
     """
-    from dataset import SequenceDataset
+    from datasets.dataset import SequenceDataset
 
     train_trajs = get_dagger_data(train_envs, rollout_policy, horizon)
     test_trajs = get_dagger_data(test_envs, rollout_policy, horizon)
@@ -166,7 +166,7 @@ def merge_sequence_datasets(dataset1, dataset2):
     Returns:
         Merged SequenceDataset
     """
-    from dataset import SequenceDataset
+    from datasets.dataset import SequenceDataset
     merged_trajs = dataset1.trajs + dataset2.trajs
     return SequenceDataset(merged_trajs, dataset1.config)
 

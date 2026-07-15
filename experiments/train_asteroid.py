@@ -1,11 +1,13 @@
-"""
-Context Accumulation Training Algorithm.
+"""ASTEROID: Asymmetric Student-Teacher Rollout In-context Distillation.
 
-This script trains a Decision Transformer using iterative data collection (DAgger-style).
-At each iteration:
-1. Collect data using current policy with increasing horizon
-2. Train model on accumulated data
-3. Evaluate and log metrics
+Trains a history-conditioned Decision Transformer to explore in partially
+observed tasks by iterative on-policy distillation from a privileged expert.
+Each iteration (Algorithm 1 in the paper):
+  1. Roll out the current student to collect on-policy contexts, with the
+     rollout horizon growing by one episode per iteration (context curriculum).
+  2. Query the clairvoyant expert for action labels on those contexts.
+  3. Train the student by conditional imitation on the accumulated dataset.
+  4. Evaluate the pure student policy and log returns.
 """
 
 import torch.multiprocessing as mp
@@ -27,11 +29,11 @@ import torch.nn.functional as F
 import tqdm
 import wandb
 
-from create_envs import create_env
-from collect_data import get_dagger_dataset, merge_sequence_datasets
-from dataset import collate_fn
-from eval_policy import evaluate_policy_on_envs, compute_episode_returns, plot_returns
-from get_rollout_policy import get_rollout_policy
+from environments.create_envs import create_env
+from datasets.collect_data import get_dagger_dataset, merge_sequence_datasets
+from datasets.dataset import collate_fn
+from experiments.eval_policy import evaluate_policy_on_envs, compute_episode_returns, plot_returns
+from environments.rollout_policy import get_rollout_policy
 from models import DecisionTransformer
 
 
@@ -252,10 +254,10 @@ def data_step(save_dir, step_id, train_envs, test_envs, rollout_policy, horizon)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Context Accumulation Training")
-    
+    parser = argparse.ArgumentParser(description="Train ASTEROID (on-policy asymmetric distillation)")
+
     # Experiment
-    parser.add_argument("--exp_name", type=str, default="context_accumulator")
+    parser.add_argument("--exp_name", type=str, default="asteroid")
     parser.add_argument("--env_name", type=str, default="darkroom-easy")
     parser.add_argument("--seed", type=int, default=42)
     
@@ -285,11 +287,11 @@ if __name__ == "__main__":
     
     # Logging
     parser.add_argument("--log_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="dpt-sweep")
+    parser.add_argument("--wandb_project", type=str, default="asteroid")
     parser.add_argument("--wandb_entity", type=str, default=None)
-    
+
     # Paths
-    parser.add_argument("--save_dir", type=str, default="./context_results")
+    parser.add_argument("--save_dir", type=str, default="results/asteroid")
 
     args = parser.parse_args()
 

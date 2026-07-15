@@ -15,9 +15,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from create_envs import create_env
-from collect_data import get_dagger_data, save_dagger_data
-from get_rollout_policy import get_rollout_policy
+from environments.create_envs import create_env
+from datasets.collect_data import get_dagger_data, save_dagger_data
+from environments.rollout_policy import get_rollout_policy
 from models import DecisionTransformer
 
 

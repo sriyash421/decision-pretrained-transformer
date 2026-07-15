@@ -19,8 +19,8 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecNormalize
 from sb3_contrib import RecurrentPPO
 
-from create_envs import create_env
-from envs.meta_env import MetaEnv, MetaVecEnv
+from environments.create_envs import create_env
+from environments.meta_env import MetaEnv, MetaVecEnv
 
 
 class WandbCallback(BaseCallback):
@@ -134,8 +134,8 @@ if __name__ == "__main__":
     
     # Logging
     parser.add_argument("--log_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="dpt-sweep")
-    parser.add_argument("--save_dir", type=str, default="./rl2_results")
+    parser.add_argument("--wandb_project", type=str, default="asteroid")
+    parser.add_argument("--save_dir", type=str, default="results/rl2")
 
     # Advisor / BCPPO
     parser.add_argument("--use_advisor", action="store_true", help="Use Advisor with learned distance predictor")

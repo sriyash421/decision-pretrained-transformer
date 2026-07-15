@@ -10,9 +10,9 @@ import numpy as np
 import seaborn as sns
 import torch
 
-from get_rollout_policy import TransformerCNNPolicy
+from environments.rollout_policy import TransformerCNNPolicy
 from models import DecisionTransformerCnn
-from procgen_env import make_maze_envs
+from environments.procgen_env import make_maze_envs
 from train_procgen_rl2_bc import RecurrentBCPPOPolicy
 
 

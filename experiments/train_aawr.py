@@ -33,11 +33,11 @@ from collections import defaultdict
 
 import matplotlib.pyplot as plt
 
-from create_envs import create_env
-from dataset import collate_fn, SequenceDataset
-from eval_policy import evaluate_policy_on_envs
+from environments.create_envs import create_env
+from datasets.dataset import collate_fn, SequenceDataset
+from experiments.eval_policy import evaluate_policy_on_envs
 from models import DecisionTransformer, AsymmetricCritic
-from get_rollout_policy import get_rollout_policy, NoisyExpertPolicy
+from environments.rollout_policy import get_rollout_policy, NoisyExpertPolicy
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -546,11 +546,11 @@ if __name__ == "__main__":
     
     # Logging
     parser.add_argument("--log_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="dpt-sweep")
+    parser.add_argument("--wandb_project", type=str, default="asteroid")
     parser.add_argument("--wandb_entity", type=str, default=None)
     
     # Paths
-    parser.add_argument("--save_dir", type=str, default="./aawr_results")
+    parser.add_argument("--save_dir", type=str, default="results/aawr")
 
     args = parser.parse_args()
 

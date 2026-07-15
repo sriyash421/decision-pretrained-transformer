@@ -14,9 +14,9 @@ from itertools import combinations
 
 import numpy as np
 
-from envs.darkroom_env import DarkroomEnv, DarkroomEnvVec
-from envs.keydoor_env import KeyDoorEnv, KeyDoorVecEnv
-from envs.navigation_env import NavigationEnv, NavigationVecEnv
+from environments.darkroom_env import DarkroomEnv, DarkroomEnvVec
+from environments.keydoor_env import KeyDoorEnv, KeyDoorVecEnv
+from environments.navigation_env import NavigationEnv, NavigationVecEnv
 
 
 def _batch_envs(envs, vec_env_class, n_envs):

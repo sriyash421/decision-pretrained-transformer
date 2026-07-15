@@ -8,7 +8,7 @@ import tqdm
 import wandb
 
 from models import Transformer
-from procgen_env import make_maze_envs
+from environments.procgen_env import make_maze_envs
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -5,7 +5,7 @@ import os
 import wandb
 import numpy as np
 
-from procgen_env import make_maze_envs
+from environments.procgen_env import make_maze_envs
 from train_context_accumulator import evaluate_policy_on_envs_procgen
 
 

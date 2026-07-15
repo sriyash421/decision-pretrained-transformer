@@ -24,7 +24,7 @@ from torch.nn.utils.rnn import pad_sequence
 import tqdm
 import wandb
 
-from procgen_env import make_maze_envs
+from environments.procgen_env import make_maze_envs
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
